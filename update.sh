@@ -115,6 +115,88 @@ case "${OSTYPE:-}" in
     ;;
 esac
 
+# curl_failure_note RC ERRFILE — the cause of a failed curl call, as one line: its exit code
+# plus the last line of its stderr (issue #980). `2>/dev/null` used to hide the cause, so
+# every failure read as "check your internet" even when the network was fine and the write
+# to a temp path failed. Callers send curl's stderr to ERRFILE (curl -sS keeps the error
+# message and drops the progress meter) and print this note only when the call failed.
+curl_failure_note() {
+    local rc="$1" errf="$2" err_line=""
+    if [ -s "$errf" ]; then
+        # tr -d '\r': a native Windows curl ends its stderr lines with CRLF.
+        err_line=$(tail -n 1 "$errf" | tr -d '\r' | cut -c1-200)
+    fi
+    printf 'curl код %s%s' "$rc" "${err_line:+; $err_line}"
+}
+
+# fetch_update_manifest URL DEST — download the update manifest (issue #943).
+# curl's stderr used to go to /dev/null, so every failure looked like "check the
+# internet"; a Windows user could not tell a timeout from a write error. Now: up to
+# 3 attempts; each failed attempt prints curl's exit code, the HTTP status and the
+# last stderr line. Only transient failures are retried (network exit codes, HTTP
+# 5xx/429); a 4xx or a certificate error stops at once. After a write failure (curl
+# exit 23, or success with an empty file) the next attempt writes through a shell
+# redirect instead of curl -o: a labelled diagnostic experiment for "the file curl
+# opens itself is blocked", it does not change TLS. The file is moved into place only
+# when complete and JSON-shaped. On failure FETCH_MANIFEST_DIAG holds the last cause.
+FETCH_MANIFEST_DIAG=""
+fetch_update_manifest() {
+    local url="$1" dest="$2"
+    local part="$dest.part" errf="$dest.err"
+    local max_attempts=3 attempt=1 mode="file" rc http err_line transient write_failure
+    while [ "$attempt" -le "$max_attempts" ]; do
+        rc=0; http="n/a"
+        if [ "$mode" = "file" ]; then
+            # shellcheck disable=SC2086  # CURL_BASE_OPTS/_CURL_SSL_OPT intentionally unquoted (multi-token flags)
+            http=$(curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sSfL -w '%{http_code}' -o "$part" "$url" 2>"$errf") || rc=$?
+        else
+            # shellcheck disable=SC2086
+            curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sSfL "$url" >"$part" 2>"$errf" || rc=$?
+        fi
+        err_line=$(tail -n 1 "$errf" 2>/dev/null | cut -c1-200)
+        if [ "$rc" -eq 0 ] && [ ! -s "$part" ]; then
+            err_line="curl завершился без ошибки, но файл пуст"
+        elif [ "$rc" -eq 0 ] && [ "$(tr -d ' \t\r\n' < "$part" | head -c 1)" != "{" ]; then
+            FETCH_MANIFEST_DIAG="ответ не похож на JSON (прокси или страница входа в сеть?), HTTP $http"
+            echo "  ⚠ Попытка $attempt из $max_attempts: $FETCH_MANIFEST_DIAG"
+            rm -f "$part" "$errf"
+            return 1
+        elif [ "$rc" -eq 0 ]; then
+            if ! mv -f "$part" "$dest" 2>"$errf"; then
+                FETCH_MANIFEST_DIAG="манифест скачан, но не записан на место: $(tail -n 1 "$errf" | cut -c1-200)"
+                echo "  ⚠ Попытка $attempt из $max_attempts: $FETCH_MANIFEST_DIAG"
+                rm -f "$part" "$errf"
+                return 1
+            fi
+            rm -f "$errf"
+            return 0
+        fi
+        FETCH_MANIFEST_DIAG="curl код $rc, HTTP $http, запись: $mode${err_line:+; $err_line}"
+        echo "  ⚠ Попытка $attempt из $max_attempts: $FETCH_MANIFEST_DIAG"
+
+        transient=false; write_failure=false
+        case "$rc" in
+            5|6|7|18|28|35|52|55|56) transient=true ;;
+            # The redirect mode cannot report the HTTP status ("n/a"): a 22 there may be a 503
+            # as well as a 404, so it is retried once more rather than given up.
+            22) case "$http" in 5??|429|n/a) transient=true ;; esac ;;
+            23) write_failure=true ;;
+            0) write_failure=true ;;   # success with an empty file
+        esac
+        if $write_failure && [ "$mode" = "file" ]; then
+            mode="stdout"
+            echo "  … диагностика: повтор с записью через перенаправление вместо curl -o"
+        elif $transient; then
+            sleep "${IWE_FETCH_RETRY_SLEEP:-2}"
+        else
+            break
+        fi
+        attempt=$((attempt + 1))
+    done
+    rm -f "$part" "$errf"
+    return 1
+}
+
 for arg in "$@"; do
     case "$arg" in
         --check|--dry-run)  CHECK_ONLY=true ;;
@@ -390,11 +472,44 @@ migrate_platform_memory() {
     return 0
 }
 
+# saving_cp_command SOURCE TARGET — the command line the reports offer for refreshing TARGET
+# from SOURCE: first save TARGET next to itself, then replace it. The user's shell runs it, so
+# each path goes through printf %q: the shell receives exactly these paths whatever they hold
+# (spaces, quotes, $, backticks, backslashes) and expands nothing inside them. The saved copy's
+# name comes from mktemp (TARGET.before-update-XXXXXX), which creates the file under a name no
+# other run has, atomically: two runs, even within one second and with the same random seed, can
+# never write into one copy, so the second run cannot replace the only copy of the user's edits
+# with the refreshed file (issue #967). Only "$bak" is left for the user's shell to expand.
+saving_cp_command() {
+    local source_q target_q
+    printf -v source_q '%q' "$1"
+    printf -v target_q '%q' "$2"
+    # shellcheck disable=SC2016  # "$bak" is meant for the user's shell, which runs this command
+    printf 'bak=$(mktemp %s.before-update-XXXXXX) && cp -p %s "$bak" && cp %s %s' "$target_q" "$target_q" "$source_q" "$target_q"
+}
+
 # issue #375: owner:user protects the deployed copy from overwrite, but protection
 # must not make upstream drift invisible. Scan the whole manifest on every real
 # update/repair pass, not only NEW_FILES/UPDATED_FILES from this invocation.
+#
+# issues #965/#967: say WHY a copy differs, using the shipped classifier. Its verdict is only
+# as strong as the history of the clone's CURRENT branch (git rev-list HEAD for this path; a
+# version that exists only on another branch is not seen), so the texts promise no more:
+#   stale    - the copy equals a version in the history of the current branch. That can be an
+#              older release, but also the pilot's own edit committed into the clone (a fork
+#              with local commits, #963), so the text says so and the offered command saves the
+#              current copy next to it before the cp (see saving_cp_command: every path is
+#              escaped, and the saved copy's name comes from mktemp, so a second run cannot
+#              replace the only copy of the pilot's edits with the refreshed file).
+#   authored - the copy equals no version in that history: the pilot's edits, a release that
+#              update.sh already applied to the clone (it never commits what it applies), or a
+#              version that lives only on another branch.
+#   anything else, including a missing classifier, keeps the generic text.
+# The classifier is called directly, not through report_author_skip(): that one counts and
+# queues files for --refresh-stale.
 report_owner_user_memory_drift() {
     local fpath deployed drift_count=0
+    local classifier="$SCRIPT_DIR/.claude/scripts/classify-workspace-copy.sh" classify_out verdict
     [ -d "$CLAUDE_MEMORY_DIR" ] && [ -f "$MANIFEST" ] && py_available || return 0
     while IFS= read -r fpath; do
         [ -n "$fpath" ] || continue
@@ -403,8 +518,26 @@ report_owner_user_memory_drift() {
         [ -f "$SCRIPT_DIR/$fpath" ] && [ -r "$deployed" ] || continue
         [ "$(get_field "$deployed" owner)" = "user" ] || continue
         if [ "$(hash_file "$SCRIPT_DIR/$fpath")" != "$(hash_file "$deployed")" ]; then
-            echo "  ⚠ $fpath — owner: user, НЕ обновлён, но шаблонная версия отличается."
-            echo "    Сверьте: diff \"$SCRIPT_DIR/$fpath\" \"$deployed\""
+            verdict=""
+            if [ -f "$classifier" ]; then
+                # </dev/null: this loop reads its paths from stdin; nothing else may take them.
+                classify_out=$(bash "$classifier" "$SCRIPT_DIR" "$fpath" "$deployed" </dev/null 2>/dev/null || true)
+                verdict="${classify_out%% *}"
+            fi
+            case "$verdict" in
+                stale)
+                    echo "  ⚠ $fpath — owner: user, НЕ обновлён: совпадает с версией в истории текущей ветки клона шаблона; если вы коммитили свои правки в клон, это могут быть и они."
+                    echo "    Обновить с сохранением копии: $(saving_cp_command "$SCRIPT_DIR/$fpath" "$deployed")"
+                    ;;
+                authored)
+                    echo "  ⚠ $fpath — owner: user, НЕ обновлён: не совпадает ни с одной версией в истории текущей ветки клона (ваши правки или уже применённый прошлый релиз)."
+                    echo "    Сверьте: diff \"$SCRIPT_DIR/$fpath\" \"$deployed\""
+                    ;;
+                *)
+                    echo "  ⚠ $fpath — owner: user, НЕ обновлён, но шаблонная версия отличается."
+                    echo "    Сверьте: diff \"$SCRIPT_DIR/$fpath\" \"$deployed\""
+                    ;;
+            esac
             drift_count=$((drift_count + 1))
         fi
     done < <($PY_BIN - "$MANIFEST" <<'PY' 2>/dev/null
@@ -477,15 +610,117 @@ author_release_regression() {
     [ "$payload_sha" != "$head_sha" ]
 }
 
+# manifest_version FILE — the first "version" value of an update-manifest.json (empty when
+# there is none). One reader for every place that needs it: the upstream manifest (Step 1),
+# the installed one for --check --fast, and the installed one when histories cannot be
+# ordered by git (rollback_by_version, #963).
+manifest_version() {
+    grep '"version"' "$1" | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/".*//'
+}
+
+# manifest_sha256_of MANIFEST PATH — the sha256 MANIFEST lists for PATH (one reader for the
+# upstream manifest in the install-path guard and for the installed one in
+# claude_template_copy_is_pristine). Prints nothing and returns 1 when there is no such entry,
+# the entries disagree or the manifest cannot be read.
+manifest_sha256_of() {
+    local manifest="$1" want="$2"
+    if py_available; then
+        "$PY_BIN" - "$manifest" "$want" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+matches = [e.get('sha256') for e in data.get('files', []) if e.get('path') == sys.argv[2]]
+uniq = set(m for m in matches if m)
+if len(uniq) != 1:
+    sys.exit(1)
+print(uniq.pop())
+PYEOF
+        return $?
+    fi
+    # Shell-фоллбек (нет python3/python): не общий JSON-парсер — опирается
+    # на фиксированный layout нашего же generate-manifest.sh
+    # (json.dump(indent=2), "path" непосредственно перед "sha256" в одном
+    # объекте, один ключ на строку). Если формат манифеста когда-нибудь
+    # разъедется с этим предположением — E2E-тест на no-python окружение
+    # это поймает (WP-529 Ф16, В3 codex).
+    awk -v want="$want" '
+        /"path"[[:space:]]*:/ {
+            line = $0
+            sub(/^[^"]*"path"[[:space:]]*:[[:space:]]*"/, "", line)
+            sub(/".*$/, "", line)
+            cur_path = line
+            next
+        }
+        /"sha256"[[:space:]]*:/ && cur_path == want {
+            line = $0
+            sub(/^[^"]*"sha256"[[:space:]]*:[[:space:]]*"/, "", line)
+            sub(/".*$/, "", line)
+            if (found && line != found_val) { ambiguous = 1 }
+            found = 1
+            found_val = line
+        }
+        END {
+            if (found && !ambiguous) { print found_val; exit 0 }
+            exit 1
+        }
+    ' "$manifest"
+}
+
+# version_compare A B — compare two plain X.Y.Z versions numerically. Prints -1, 0 or 1 (A is
+# older than, equal to, newer than B) and returns 0; returns 2 and prints nothing when either
+# argument is not digits-only X.Y.Z (at most 9 digits per part, so the arithmetic cannot
+# overflow). "0.9.0" is older than "0.10.0": a string comparison says the opposite.
+version_compare() {
+    local a="$1" b="$2" part_a part_b re='^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$'
+    [[ $a =~ $re ]] && [[ $b =~ $re ]] || return 2
+    while [ -n "$a" ]; do
+        part_a=${a%%.*}
+        part_b=${b%%.*}
+        # 10#: a part such as "08" is the decimal 8, not an invalid octal literal.
+        if [ $((10#$part_a)) -lt $((10#$part_b)) ]; then echo -1; return 0; fi
+        if [ $((10#$part_a)) -gt $((10#$part_b)) ]; then echo 1; return 0; fi
+        case "$a" in
+            *.*) a=${a#*.}; b=${b#*.} ;;
+            *) a="" ;;
+        esac
+    done
+    echo 0
+}
+
+# rollback_by_version — issue #963: when the installed copy and the release share no commit
+# (a fork whose history was rewritten, e.g. a different root commit), git merge-base cannot
+# order them; order them by manifest version instead: the installed update-manifest.json
+# against UPSTREAM_VERSION (set in Step 1, before the rollback check runs).
+# Exit codes (the same contract as detect_release_rollback):
+#   0 - the release is strictly older than the installed version: a rollback
+#   1 - the release is newer or equal (equal versions do not prove a rollback)
+#   2 - cannot tell: a shallow clone (a real ancestor may be cut off), no installed manifest,
+#       or a version that is not plain X.Y.Z
+rollback_by_version() {
+    local installed cmp
+    # A shallow clone reports "no common ancestor" also for histories that do share one.
+    [ "$(git -C "$SCRIPT_DIR" rev-parse --is-shallow-repository 2>/dev/null)" = "false" ] || return 2
+    [ -f "$SCRIPT_DIR/update-manifest.json" ] || return 2
+    installed=$(manifest_version "$SCRIPT_DIR/update-manifest.json")
+    cmp=$(version_compare "${UPSTREAM_VERSION:-}" "$installed") || return 2
+    [ "$cmp" = "-1" ]
+}
+
 # issue #863: detect when the default release channel would roll back an install
 # that is already newer than the latest published release. Fires in release
 # channel when SCRIPT_DIR is a git repo and local HEAD contains commits that are
-# not present in the release (i.e. the release is strictly behind local).
+# not present in the release (i.e. the release is strictly behind local). When the
+# two histories share no commit at all (#963) the versions in the manifests decide.
 #
 # Exit codes:
-#   0 - rollback detected (release is a strict ancestor of local HEAD)
-#   1 - no rollback (release is HEAD, ahead, or unrelated)
-#   2 - cannot determine (network/history missing) -> caller must block --yes
+#   0 - rollback detected: the release is a strict ancestor of local HEAD, or (no common
+#       ancestor) its manifest version is older than the installed one
+#   1 - no rollback (release is HEAD, ahead, or, with no common ancestor, not older by version)
+#   2 - cannot determine (network/history missing, unreadable versions, a shallow clone with
+#       no visible common ancestor) -> caller must block --yes
 detect_release_rollback() {
     [ "$UPDATE_CHANNEL" = "release" ] || return 1
     [ -n "$RELEASE_SHA" ] || return 1
@@ -500,7 +735,7 @@ detect_release_rollback() {
     # the install's `origin` may point to a different fork or the local tag may
     # differ from the published one.
     if ! printf '%s' "$release_sha" | grep -qxE '[0-9a-f]{40}'; then
-        commit_json=$(github_api_get "$API_BASE/commits/$release_sha" 2>/dev/null) || return 2
+        commit_json=$(github_api_get "$API_BASE/commits/$release_sha") || return 2
         # Prefer JSON parsing; fall back to sed only when Python is unavailable.
         # Guard the assignment with || return 2: under set -e a bare failing
         # command-substitution aborts the whole script when this function is
@@ -531,7 +766,14 @@ print(sha)') || return 2
         fi
     fi
 
-    merge_base=$(git -C "$SCRIPT_DIR" merge-base "$local_sha" "$release_sha" 2>/dev/null) || return 2
+    # git merge-base: 0 = found, 1 = no common ancestor, anything else (128...) = an error.
+    local merge_base_rc=0
+    merge_base=$(git -C "$SCRIPT_DIR" merge-base "$local_sha" "$release_sha" 2>/dev/null) || merge_base_rc=$?
+    case "$merge_base_rc" in
+        0) ;;
+        1) rollback_by_version; return $? ;;
+        *) return 2 ;;
+    esac
     [ -n "$merge_base" ] || return 2
 
     # Rollback if the release commit is an ancestor of local HEAD but not equal
@@ -579,7 +821,9 @@ report_author_skip() {
             # Byte-identical to the template — not a real skip, no warning needed.
             ;;
         stale)
-            echo "  ⚠ $fpath — author_mode: отстал от шаблона, авторских правок нет. Обновить: cp \"$SCRIPT_DIR/$fpath\" \"$dst\""
+            # The same saving command as in report_owner_user_memory_drift(): a bare cp loses the copy
+            # when the verdict misleads, and a fixed backup name is overwritten by a rerun.
+            echo "  ⚠ $fpath — author_mode: отстал от шаблона, авторских правок нет. Обновить: $(saving_cp_command "$SCRIPT_DIR/$fpath" "$dst")"
             AUTHOR_SKIP_STALE=$((AUTHOR_SKIP_STALE + 1))
             AUTHOR_STALE_PAIRS+=("$fpath|$dst")
             ;;
@@ -998,7 +1242,9 @@ except FileNotFoundError:
 if not stat.S_ISREG(before.st_mode):
     print(json.dumps(["non-regular", before.st_dev, before.st_ino, before.st_mode]))
     raise SystemExit(0)
-flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+# O_BINARY exists on Windows only: without it the descriptor is in text mode (\r\n translation, Ctrl-Z ends
+# the file) and the hash below would not be the hash of the actual bytes.
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
 descriptor = os.open(path, flags)
 try:
     opened = os.fstat(descriptor)
@@ -1006,7 +1252,11 @@ try:
         before.st_dev, before.st_ino, before.st_mode, before.st_size,
         before.st_mtime_ns, before.st_ctime_ns,
     )
-    if (
+    # Since CPython 3.12 on Windows lstat() reports the creation time as st_ctime and fstat() the metadata
+    # change time, so the two can disagree for a file modified after it was created (issue #989): the
+    # cross-API comparison is POSIX only. The lstat taken after the read below, compared with the one above,
+    # still catches a swap that is in place by then.
+    if os.name != "nt" and (
         opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size,
         opened.st_mtime_ns, opened.st_ctime_ns,
     ) != identity:
@@ -1759,6 +2009,20 @@ backfill_executor_catalog_generator() {
     backfill_governance_seed_script "scripts/generate-executor-catalog.py"
 }
 
+# ds-publish.sh (issue #941): strategist.sh publishes its commits through
+# $governance/scripts/ds-publish.sh, which the template never shipped. Delivered only
+# when the governance repo has no such file: an existing one is not ours to replace
+# (an installation may keep its own, larger publisher at the same path).
+backfill_ds_publish() {
+    local governance_repo="${EFFECTIVE_GOVERNANCE_REPO:-$(effective_governance_repo)}"
+    local target_path="$WORKSPACE_DIR/$governance_repo/scripts/ds-publish.sh"
+    if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+        echo "  ✓ scripts/ds-publish.sh уже есть в $governance_repo, не заменяю."
+        return 0
+    fi
+    backfill_governance_seed_script "scripts/ds-publish.sh"
+}
+
 # #533: update is the one reliable point at which an existing private fault
 # profile can be brought onto the current schema and permission contract.  The
 # canonical CLI's no-create observational `stats` command is used here: it
@@ -1857,6 +2121,10 @@ run_post_apply_backfills_or_die() {
         echo "  ОШИБКА: generator executor catalog не обновлён; обновление оставлено незавершённым." >&2
         return 1
     fi
+
+    echo ""
+    echo "Публикатор коммитов ds-publish.sh (upgrade backfill)..."
+    backfill_ds_publish || echo "  ⚠ scripts/ds-publish.sh не доставлен: ночные роли оставят коммиты локальными, пока его нет (issue #941)." >&2
 
     echo ""
     echo "Executor catalog (upgrade backfill)..."
@@ -2179,6 +2447,7 @@ print_extra_write_targets() {
     echo "  • $governance_dir/scripts/update-derived-snapshot.py — обновлятор derived snapshot"
     echo "  • $governance_dir/scripts/generate-executor-catalog.py — генератор каталога исполнителей"
     echo "  • $governance_dir/scripts/executor-catalog.yaml — каталог исполнителей"
+    echo "  • $governance_dir/scripts/ds-publish.sh — публикатор коммитов ночных ролей (кладётся только если файла нет, существующий не трогается)"
     echo "  • $governance_dir/exocortex/agent-fault-profile/ — только миграция/права существующей приватной БД; отсутствующий профиль не создаётся"
     echo "    Symlink-пути блокируют backfill. Отличающиеся installer/hooks сохраняются в .git/hook-backups/ и заменяются."
     echo "    Локально изменённые Day Open reader/snapshot updater/executor-catalog generator блокируют обновление; executor-catalog.yaml — генерируемый файл и заменяется при смысловом расхождении."
@@ -2230,9 +2499,12 @@ run_sync_canary() {
         return 0
     fi
 
+    # IWE_TEMPLATE: a copy of the bundle kept in the governance repo has no scripts/lib next
+    # to it, and the shared WP-number library (wp-num.sh, issue #954) lives in the template
+    # clone -- tell the bundle where it is instead of failing the canary on a missing file.
     local canary_output canary_status
     canary_output=$(IWE_WORKSPACE="$WORKSPACE_DIR" IWE_GOVERNANCE_REPO="$governance_repo" \
-        bash "$sync_bundle" --self-test 2>&1)
+        IWE_TEMPLATE="$SCRIPT_DIR" bash "$sync_bundle" --self-test 2>&1)
     canary_status=$?
     if [ "$canary_status" -eq 0 ]; then
         echo "  ✓ Canary (реестр РП): OK"
@@ -2380,7 +2652,10 @@ github_api_get() {
     if command -v gh >/dev/null 2>&1 && \
        GH_DEBUG='' DEBUG='' GH_PROMPT_DISABLED=1 \
            gh auth status --hostname github.com >/dev/null 2>&1; then
-        endpoint="/${api_url#https://api.github.com/}"
+        # No leading slash (issue #980): Git Bash (MSYS) rewrites an argument that starts
+        # with "/" into a Windows path ("C:/Program Files/Git/repos/...") before gh sees
+        # it, and gh rejects that endpoint. gh accepts "repos/..." everywhere.
+        endpoint="${api_url#https://api.github.com/}"
         if ! GH_DEBUG='' DEBUG='' GH_PROMPT_DISABLED=1 \
              gh api --hostname github.com --method GET "$endpoint"; then
             echo "ОШИБКА: authenticated GitHub API request via gh failed; fallback disabled." >&2
@@ -2527,31 +2802,54 @@ echo "[0] Проверка update.sh..."
 # Capture hash before any network activity — used for --check integrity guard below (fix #205)
 SELF_HASH_BEFORE=$(hash_file "$SCRIPT_DIR/update.sh")
 REMOTE_UPDATE="$TMPDIR_UPDATE/update.sh.new"
-if curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sSfL "$RAW_BASE/update.sh" -o "$REMOTE_UPDATE" 2>/dev/null; then
+STEP0_ERR="$TMPDIR_UPDATE/update.sh.err"
+STEP0_RC=0
+# shellcheck disable=SC2086  # CURL_BASE_OPTS/_CURL_SSL_OPT intentionally unquoted (multi-token flags)
+curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sSfL "$RAW_BASE/update.sh" -o "$REMOTE_UPDATE" 2>"$STEP0_ERR" || STEP0_RC=$?
+if [ "$STEP0_RC" -ne 0 ]; then
+    # issues #955/#980: "could not check" is not "checked, up to date". The failure used
+    # to fall through to the "актуален" line below, with curl's cause thrown away.
+    echo "  ⚠ не удалось проверить update.sh: $(curl_failure_note "$STEP0_RC" "$STEP0_ERR")"
+elif [ ! -s "$REMOTE_UPDATE" ]; then
+    # curl exit 0 with an empty body (a proxy or a login page that returns nothing) is a
+    # failed check as well: the empty file differs from the local one, so it used to pass
+    # for a newer update.sh and a normal run replaced the updater with a 0-byte file.
+    echo "  ⚠ не удалось проверить update.sh: пустой ответ"
+elif [ "$(head -c 2 "$REMOTE_UPDATE")" != "#!" ]; then
+    # Same for an answer that is no script: HTTP 200 with the HTML of a Wi-Fi login page or a
+    # proxy. update.sh starts with a "#!" line (any interpreter path, /bin/bash or
+    # /usr/bin/env bash alike); anything else must not replace the running updater.
+    echo "  ⚠ не удалось проверить update.sh: ответ не похож на скрипт"
+elif ! bash -n "$REMOTE_UPDATE" 2>/dev/null; then
+    # "#!" alone proves nothing about integrity: a script cut off in the middle (an incomplete
+    # body served as a finished HTTP 200) starts with it too. A syntax check is the one test
+    # that needs no reference hash, which Step 0 does not have yet (the manifest comes later),
+    # and it runs with the same `bash` that the replacement is re-executed with.
+    echo "  ⚠ не удалось проверить update.sh: ответ не похож на рабочий скрипт"
+else
     LOCAL_HASH=$(hash_file "$SCRIPT_DIR/update.sh")
     REMOTE_HASH=$(hash_file "$REMOTE_UPDATE")
-    if [ "$LOCAL_HASH" != "$REMOTE_HASH" ]; then
-        if $CHECK_ONLY; then
-            # In --check mode: report available update without touching the file
-            echo "  ⚠ Новая версия update.sh доступна. Запустите без --check для обновления."
-        else
-            echo "  Найдена новая версия update.sh — обновляю..."
-            # issue #505 class (residual, found in the same sweep): replace
-            # the RUNNING script via sibling tmp + mv — rename swaps the
-            # directory entry and this process keeps its old inode; a plain cp
-            # truncates the very file bash is executing. Historically survived
-            # only because the few remaining commands sat in bash's read
-            # buffer.
-            _boot_staged="$SCRIPT_DIR/.update.sh.staged.$$"
-            cp "$REMOTE_UPDATE" "$_boot_staged"
-            chmod +x "$_boot_staged"
-            mv -f "$_boot_staged" "$SCRIPT_DIR/update.sh"
-            echo "  Перезапуск..."
-            exec bash "$SCRIPT_DIR/update.sh" "$@"
-        fi
+    if [ "$LOCAL_HASH" = "$REMOTE_HASH" ]; then
+        echo "  update.sh актуален."
+    elif $CHECK_ONLY; then
+        # In --check mode: report available update without touching the file
+        echo "  ⚠ Новая версия update.sh доступна. Запустите без --check для обновления."
+    else
+        echo "  Найдена новая версия update.sh — обновляю..."
+        # issue #505 class (residual, found in the same sweep): replace
+        # the RUNNING script via sibling tmp + mv — rename swaps the
+        # directory entry and this process keeps its old inode; a plain cp
+        # truncates the very file bash is executing. Historically survived
+        # only because the few remaining commands sat in bash's read
+        # buffer.
+        _boot_staged="$SCRIPT_DIR/.update.sh.staged.$$"
+        cp "$REMOTE_UPDATE" "$_boot_staged"
+        chmod +x "$_boot_staged"
+        mv -f "$_boot_staged" "$SCRIPT_DIR/update.sh"
+        echo "  Перезапуск..."
+        exec bash "$SCRIPT_DIR/update.sh" "$@"
     fi
 fi
-echo "  update.sh актуален."
 echo ""
 
 # === Step 1: Fetch manifest ===
@@ -2559,10 +2857,12 @@ echo "[1] Загрузка манифеста..."
 MANIFEST_URL="$RAW_BASE/update-manifest.json"
 MANIFEST="$TMPDIR_UPDATE/manifest.json"
 
-if ! curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sSfL "$MANIFEST_URL" -o "$MANIFEST" 2>/dev/null; then
+if ! fetch_update_manifest "$MANIFEST_URL" "$MANIFEST"; then
     echo "ОШИБКА: Не удалось загрузить манифест обновлений."
     echo "  URL: $MANIFEST_URL"
-    echo "  Проверьте подключение к интернету."
+    echo "  Последний отказ: $FETCH_MANIFEST_DIAG"
+    echo "  Проверьте подключение к интернету. Значение кода curl объясняет раздел EXIT CODES в man curl."
+    echo "  Если такая же команда curl вручную работает, а здесь нет, приложите этот вывод к обращению (issue #943)."
     exit 1
 fi
 
@@ -2594,7 +2894,7 @@ PY
 fi
 
 # Parse version from manifest
-UPSTREAM_VERSION=$(grep '"version"' "$MANIFEST" | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/".*//')
+UPSTREAM_VERSION=$(manifest_version "$MANIFEST")
 echo "  Версия upstream: $UPSTREAM_VERSION"
 echo ""
 
@@ -2611,7 +2911,7 @@ echo ""
 if $CHECK_ONLY && $FAST_CHECK; then
     LOCAL_MANIFEST="$SCRIPT_DIR/update-manifest.json"
     LOCAL_VERSION=""
-    [ -f "$LOCAL_MANIFEST" ] && LOCAL_VERSION=$(grep '"version"' "$LOCAL_MANIFEST" | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/".*//')
+    [ -f "$LOCAL_MANIFEST" ] && LOCAL_VERSION=$(manifest_version "$LOCAL_MANIFEST")
 
     if py_available && [ -f "$LOCAL_MANIFEST" ]; then
         # issue #402: paths passed via argv, not interpolated into the -c string —
@@ -2785,12 +3085,12 @@ for entry in data.get('files', []):
             # them). repair_pass() iterates the WHOLE manifest (every declared
             # path, not just subdirectories), so a missing/stale loose file needs
             # the same repair arm as the subdir ones, or it is silently skipped.
-            .claude/skills/*|.claude/hooks/*|.claude/rules/*|.claude/rules-lazy/*|.claude/lib/*|.claude/config/*|.claude/detectors/*|.claude/scripts/*|.claude/agents/*|.claude/styles/*|.claude/templates/*|.claude/*.yaml|.claude/*.yml|.claude/*.example)
+            .claude/skills/*|.claude/hooks/*|.claude/rules/*|.claude/rules-lazy/*|.claude/lib/*|.claude/bin/*|.claude/config/*|.claude/detectors/*|.claude/scripts/*|.claude/agents/*|.claude/styles/*|.claude/templates/*|.claude/*.yaml|.claude/*.yml|.claude/*.example)
                 dst="$WORKSPACE_DIR/$fpath"
                 if [ ! -f "$dst" ]; then
                     mkdir -p "$(dirname "$dst")"
                     if copy_platform_file_preserving_user_space "$SCRIPT_DIR/$fpath" "$dst" "$fpath"; then
-                        case "$fpath" in *.sh) chmod +x "$dst" ;; esac
+                        case "$fpath" in *.sh|.claude/bin/*) chmod +x "$dst" ;; esac
                         echo "  ⟲ $fpath → workspace (repair)"
                         REPAIRED=$((REPAIRED + 1))
                     fi
@@ -2798,7 +3098,7 @@ for entry in data.get('files', []):
                     report_author_skip "$fpath" "$dst"
                 elif [ -r "$dst" ] && [ "$(hash_file "$SCRIPT_DIR/$fpath")" != "$(hash_file "$dst")" ]; then
                     if copy_platform_file_preserving_user_space "$SCRIPT_DIR/$fpath" "$dst" "$fpath"; then
-                        case "$fpath" in *.sh) chmod +x "$dst" ;; esac
+                        case "$fpath" in *.sh|.claude/bin/*) chmod +x "$dst" ;; esac
                         echo "  ⟲ $fpath → workspace (stale repair)"
                         REPAIRED=$((REPAIRED + 1))
                     fi
@@ -2912,14 +3212,18 @@ sync_workspace_claude_md() {
                 fi
             else
                 WS_CONFLICTS=$(grep -c '^<<<<<<<' "$TMPDIR_UPDATE/ws-claude-merged.md" 2>/dev/null || true); WS_CONFLICTS=${WS_CONFLICTS:-0}
-                cp "$TMPDIR_UPDATE/ws-claude-merged.md" "$WS_CURRENT"
-                CLAUDE_CONFLICTS=$((CLAUDE_CONFLICTS + WS_CONFLICTS))
-                if [ "$WS_CONFLICTS" -gt 0 ]; then
+                if [ "$WS_CONFLICTS" -eq 0 ]; then
+                    # Non-zero without a single marker is not a conflict: git did not merge.
+                    # Its (empty) output must not replace the pilot's file.
+                    claude_merge_failed "$WS_CURRENT" "$WS_NEW"
+                else
+                    cp "$TMPDIR_UPDATE/ws-claude-merged.md" "$WS_CURRENT"
+                    CLAUDE_CONFLICTS=$((CLAUDE_CONFLICTS + WS_CONFLICTS))
                     # issue #226: don't abort here — a CLAUDE.md conflict is an isolated
                     # artifact, not a reason to skip the rest of the delivery (memory/hooks/
                     # skills propagation, repair-pass, commit). Warn now, fail at the end.
-                    # issue #711: do NOT advance $WS_BASE here (unlike the no-conflict
-                    # branch below) — advancing it made the next run's `diff -q
+                    # issue #711: do NOT advance $WS_BASE here (unlike the clean-merge
+                    # branch above) — advancing it made the next run's `diff -q
                     # "$WORKSPACE_DIR/.claude.md.base" "$WS_NEW"` gate at the top of this
                     # function succeed even though $WS_CURRENT still had unresolved
                     # <<<<<<< markers, so update.sh reported "Всё актуально" on a corrupt
@@ -2933,9 +3237,6 @@ sync_workspace_claude_md() {
                     echo "    Конфликты обозначены <<<<<<< / ======= / >>>>>>>"
                     CLAUDE_CONFLICT_DETECTED=true
                     CLAUDE_CONFLICT_FILES+=("$WS_CURRENT")
-                else
-                    cp "$WS_NEW" "$WS_BASE"
-                    echo "  ✓ $WS_CURRENT обновлён (3-way merge)"
                 fi
             fi
         elif [ ! -f "$WS_CURRENT" ]; then
@@ -2975,12 +3276,62 @@ sync_workspace_claude_md() {
     fi
 }
 
+# claude_template_copy_matches_workspace_base FILE — B1 (WP-7 F193): setup.sh
+# (since v0.38.10) keeps the CLAUDE.md merge base only in the workspace root,
+# never in the template repo, so Step 5 found no $SCRIPT_DIR/.claude.md.base on
+# such installs and kept the #541 refusal on every run (exit 49, CLAUDE.md
+# never updated, .update-incomplete forever). That workspace base is the
+# substituted template copy as of the last successful sync: when FILE,
+# substituted exactly as sync_workspace_claude_md() does, matches it byte for
+# byte, a 3-way merge of the copy would return the upstream file unchanged.
+claude_template_copy_matches_workspace_base() {
+    local substituted="$TMPDIR_UPDATE/claude-template-substituted.md"
+    [ -f "$WORKSPACE_DIR/.claude.md.base" ] || return 1
+    substitute_claude_placeholders "$1" "$substituted" || return 1
+    # An empty copy equal to an empty base is not "unedited", it is a broken pair.
+    [ -s "$substituted" ] || return 1
+    cmp -s "$substituted" "$WORKSPACE_DIR/.claude.md.base"
+}
+
+# claude_template_copy_is_pristine FILE — the other half of the B1 test. The
+# workspace base alone does not prove FILE was never edited: the #541 refusal
+# leaves an edited copy in place, sync_workspace_claude_md() then advances the
+# base to that edited copy, and on the next run "copy == base" holds for it too
+# (found by the round-16 peer review). So FILE must also be, byte for byte,
+#   - the file the installed update-manifest.json lists: the release this
+#     install last updated to (Step 6e replaces the manifest only after Step 5,
+#     so it is still the old one here), or
+#   - the file committed at the clone's HEAD: an install that never took a
+#     CLAUDE.md update, the stuck state this fix heals (update.sh commits
+#     nothing, so on its own this holds only until the first update).
+# A copy edited and then committed by hand passes the second test; its text stays in the history.
+claude_template_copy_is_pristine() {
+    local copy="$1" delivered committed
+    delivered=$(manifest_sha256_of "$SCRIPT_DIR/update-manifest.json" "CLAUDE.md" 2>/dev/null) || delivered=""
+    if [ -n "$delivered" ] && [ "$(hash_file "$copy")" = "$delivered" ]; then
+        return 0
+    fi
+    command -v git >/dev/null 2>&1 || return 1
+    committed=$(git -C "$SCRIPT_DIR" rev-parse --verify -q "HEAD:CLAUDE.md" 2>/dev/null) || return 1
+    [ "$(git -C "$SCRIPT_DIR" hash-object -- "$copy" 2>/dev/null)" = "$committed" ]
+}
+
+# claude_merge_failed FILE NEW — `git merge-file` failed without a conflict to show (no
+# markers in its output): there is no merge result, so FILE is left exactly as it is, the
+# merge base is not advanced and the run ends in EXIT_CONFLICT with a pointer to git.
+claude_merge_failed() {
+    CLAUDE_MERGE_FAILED_FILES+=("$1")
+    echo "  ⚠ $1 НЕ тронут — git merge-file не выдал слияния (git не работает или файл нечитаем?)."
+    echo "    Проверьте: git --version. Сверить вручную: diff \"$1\" \"$2\""
+}
+
 # issue #541 cold-review (P2, DP.SC.172): the CLAUDE.md conflict/missing-base
 # check-then-exit-49 idiom now has 3 call sites (the two new early-exit gates
 # below, plus the pre-existing final gate at the end of the script) — third
 # repetition, extract instead of copy-pasting a fourth time.
 claude_conflict_gate() {
-    if $CLAUDE_CONFLICT_DETECTED || [ "${#CLAUDE_BASE_MISSING_FILES[@]}" -gt 0 ] || [ "${#CLAUDE_SILENT_LOSS_FILES[@]}" -gt 0 ]; then
+    if $CLAUDE_CONFLICT_DETECTED || [ "${#CLAUDE_BASE_MISSING_FILES[@]}" -gt 0 ] || [ "${#CLAUDE_SILENT_LOSS_FILES[@]}" -gt 0 ] \
+        || [ "${#CLAUDE_MERGE_FAILED_FILES[@]}" -gt 0 ]; then
         echo "  ⚠ Workspace-копия CLAUDE.md требует ручной сверки (см. предупреждения выше)."
         exit "$EXIT_CONFLICT"
     fi
@@ -3012,6 +3363,11 @@ CLAUDE_BASE_MISSING_FILES=()
 # reported separately (detect_claude_silent_loss above), so the summary
 # points at the right cause instead of "no base file" or "look for markers".
 CLAUDE_SILENT_LOSS_FILES=()
+# WP-7 F193 (round-16 cold review): a FOURTH class — git itself failed. `git merge-file`
+# exited non-zero without a single conflict marker and without a merge result (a macOS
+# whose Command Line Tools went missing prints an xcrun error and exits 1 for every git
+# command). The empty output used to be copied over CLAUDE.md as a "clean" merge.
+CLAUDE_MERGE_FAILED_FILES=()
 
 # WP-546 (peer-session 2026-08-20-11, WP-546 Ф2 consensus with Codex): the
 # manifest loop used to run one `curl` per file, sequentially — 632 files at
@@ -3370,27 +3726,33 @@ download_batch() {
     [ $# -eq 0 ] && return 0
     local p dst
     if $USE_PARALLEL_DOWNLOAD; then
-        local cfg
+        local cfg batch_err batch_rc=0
         # Under $TMPDIR_UPDATE, not a bare mktemp (cold-context review,
         # peer-session 2026-08-21-09): cleanup_update()'s EXIT trap removes
         # $TMPDIR_UPDATE wholesale, so a signal or crash between this mktemp
         # and the `rm -f "$cfg"` below no longer leaks a temp file — the old
         # bare mktemp location was outside that trap's reach.
         cfg=$(mktemp "$TMPDIR_UPDATE/curl-batch.XXXXXX")
+        batch_err="$cfg.err"
         for p in "$@"; do
             dst="$TMPDIR_UPDATE/files/$p"
             mkdir -p "$(dirname "$dst")"
             printf 'url = "%s/%s"\noutput = "%s"\n' "$RAW_BASE" "$p" "$dst" >> "$cfg"
         done
         # shellcheck disable=SC2086  # CURL_BASE_OPTS/_CURL_SSL_OPT intentionally unquoted (multi-token flags)
-        # `|| true`: a batch failing outright (e.g. every URL in it
+        # `|| batch_rc=$?`: a batch failing outright (e.g. every URL in it
         # unreachable) must not trip `set -e` and abort the whole update —
         # the per-file presence check right after this call is what
         # actually decides success per file, same as the old code's
         # per-file `if curl ...` (Ф2 peer-session review; all found live
         # testing this exact function).
-        curl $CURL_BASE_OPTS $_CURL_SSL_OPT -f --remove-on-error --parallel --parallel-max 8 -K "$cfg" 2>/dev/null || true
-        rm -f "$cfg"
+        # -sS (not the default progress meter): stderr goes to a file whose last
+        # line names the cause, shown below only when the batch failed (#980).
+        curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sS -f --remove-on-error --parallel --parallel-max 8 -K "$cfg" 2>"$batch_err" || batch_rc=$?
+        if [ "$batch_rc" -ne 0 ]; then
+            echo "  ⚠ пакетная загрузка: $(curl_failure_note "$batch_rc" "$batch_err")" >&2
+        fi
+        rm -f "$cfg" "$batch_err"
     else
         # Sequential fallback (peer-session 2026-08-21-09): one curl call
         # per file, same CURL_BASE_OPTS/-f as the parallel path. No
@@ -3406,18 +3768,31 @@ download_batch() {
         # file mid-transfer, or clobber it after "a.part" already landed.
         # mktemp in the same destination directory makes the temp name
         # unpredictable and immune to any manifest content.
+        #
+        # A failed call names its file and curl's cause (#980); the first 5 per
+        # call are shown, the rest are counted, so a dead network cannot flood
+        # the output with one line per manifest entry.
+        local dst_tmp seq_err="$TMPDIR_UPDATE/curl-single.err" seq_rc failed=0
         for p in "$@"; do
             dst="$TMPDIR_UPDATE/files/$p"
             mkdir -p "$(dirname "$dst")"
-            local dst_tmp
             dst_tmp=$(mktemp "$dst.XXXXXX")
             # shellcheck disable=SC2086
-            if curl $CURL_BASE_OPTS $_CURL_SSL_OPT -f -o "$dst_tmp" "$RAW_BASE/$p" 2>/dev/null; then
+            if curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sS -f -o "$dst_tmp" "$RAW_BASE/$p" 2>"$seq_err"; then
                 mv "$dst_tmp" "$dst"
             else
+                seq_rc=$?
                 rm -f "$dst_tmp"
+                failed=$((failed + 1))
+                if [ "$failed" -le 5 ]; then
+                    echo "  ⚠ $p: $(curl_failure_note "$seq_rc" "$seq_err")" >&2
+                fi
             fi
         done
+        if [ "$failed" -gt 5 ]; then
+            echo "  ⚠ ещё $((failed - 5)) сбоев загрузки не показано (первые 5 выше)" >&2
+        fi
+        rm -f "$seq_err"
     fi
 }
 
@@ -3983,12 +4358,20 @@ for f in "${UPDATED_FILES[@]}"; do
                     echo "  ~ $f (3-way merge, $CONFLICT_COUNT конфликтов — разрешите вручную)"
                     echo "    Конфликты обозначены <<<<<<< / ======= / >>>>>>>"
                 else
-                    # git merge-file returned non-zero but no conflict markers — treat as success
-                    cp "$TMPDIR_UPDATE/claude-merged.md" "$CURRENT_FILE"
-                    cp "$NEW_FILE" "$BASE_FILE"
-                    echo "  ~ $f (3-way merge)"
+                    # Non-zero without a single marker is not a conflict: git did not merge.
+                    # This branch used to "treat it as success" and copy the (empty) output
+                    # over the file.
+                    claude_merge_failed "$CURRENT_FILE" "$NEW_FILE"
                 fi
             fi
+        elif [ ! -f "$BASE_FILE" ] && claude_template_copy_matches_workspace_base "$CURRENT_FILE" \
+            && claude_template_copy_is_pristine "$CURRENT_FILE"; then
+            # B1: nothing to merge in an unedited template copy, upstream goes in
+            # as is. No base is written here (setup.sh: the template repo never
+            # receives one); sync_workspace_claude_md() in Step 6 merges the
+            # workspace copy against the workspace base, keeping the pilot's edits.
+            cp "$NEW_FILE" "$CURRENT_FILE"
+            echo "  ~ $f обновлён (копия в каталоге шаблона не правилась)"
         else
             # issue #336: no base file (first migration or lost .claude.md.base) — a
             # blind `cp $NEW_FILE $CURRENT_FILE` silently discarded any pilot edit to
@@ -4018,6 +4401,9 @@ for f in "${UPDATED_FILES[@]}"; do
                 CLAUDE_BASE_MISSING_FILES+=("$CURRENT_FILE")
                 echo "  ⚠ $f НЕ тронут — базовый файл для слияния отсутствовал."
                 echo "    Сверьте свои правки §8/§9 вручную с шаблонной версией: diff \"$CURRENT_FILE\" \"$NEW_FILE\""
+                if [ -f "${WORKSPACE_DIR:-}/.claude.md.base" ]; then
+                    echo "    База в рабочей папке есть, но копия в каталоге шаблона не совпадает ни с файлом прошлого обновления (update-manifest.json), ни с закоммиченным в клоне: похоже, её правили вручную."
+                fi
             fi
         fi
     elif [[ "$f" == .claude/skills/*/SKILL.md ]]; then
@@ -4355,6 +4741,7 @@ sync_workspace_claude_md
 # Copy memory files to Claude projects directory
 if [ -d "$CLAUDE_MEMORY_DIR" ]; then
     MEM_UPDATED=0
+    MEM_REPLACED=()
     for f in "${NEW_FILES[@]}" "${UPDATED_FILES[@]}"; do
         case "$f" in
             memory/*.md|memory/*.yaml|memory/*.yml)
@@ -4378,6 +4765,14 @@ if [ -d "$CLAUDE_MEMORY_DIR" ]; then
                         # эта ветка тоже слепо копировала SCRIPT_DIR поверх live-копии.
                         report_author_skip "$f" "$dst"
                     else
+                        # issue #967: a platform memory file the pilot has edited (e.g.
+                        # memory/navigation.md holds per-installation notes) used to be
+                        # replaced here by a bare cp, with no backup, exactly like the
+                        # repair pass did before #847. Save the previous version first.
+                        if [ -f "$dst" ] && [ "$(hash_file "$SCRIPT_DIR/$f")" != "$(hash_file "$dst")" ]; then
+                            backup_memory_file_before_overwrite "$f" "$dst"
+                            MEM_REPLACED+=("$f")
+                        fi
                         cp "$SCRIPT_DIR/$f" "$dst"
                         MEM_UPDATED=$((MEM_UPDATED + 1))
                     fi
@@ -4387,6 +4782,13 @@ if [ -d "$CLAUDE_MEMORY_DIR" ]; then
     done
     if [ "$MEM_UPDATED" -gt 0 ]; then
         echo "  ✓ $MEM_UPDATED memory-файлов обновлено в $CLAUDE_MEMORY_DIR"
+    fi
+    if [ "${#MEM_REPLACED[@]}" -gt 0 ]; then
+        MEM_REPLACED_LIST=""
+        for f in ${MEM_REPLACED[@]+"${MEM_REPLACED[@]}"}; do
+            MEM_REPLACED_LIST="${MEM_REPLACED_LIST:+$MEM_REPLACED_LIST, }$f"
+        done
+        echo "  ⚠ Заменено файлов памяти платформы: ${#MEM_REPLACED[@]} ($MEM_REPLACED_LIST); прежние версии сохранены в $MEMORY_BACKUP_RUN"
     fi
     echo "  ✓ memory/MEMORY.md — не тронут"
 fi
@@ -4445,7 +4847,7 @@ for f in "${NEW_FILES[@]}" "${UPDATED_FILES[@]}"; do
         # NEW_FILES entry for one silently fell through this loop and never
         # reached disk. None of them carry a USER-SPACE block, so the same
         # helper as the subdir arms is enough.
-        .claude/skills/*|.claude/hooks/*|.claude/rules/*|.claude/rules-lazy/*|.claude/lib/*|.claude/config/*|.claude/detectors/*|.claude/scripts/*|.claude/agents/*|.claude/styles/*|.claude/templates/*|.claude/*.yaml|.claude/*.yml|.claude/*.example)
+        .claude/skills/*|.claude/hooks/*|.claude/rules/*|.claude/rules-lazy/*|.claude/lib/*|.claude/bin/*|.claude/config/*|.claude/detectors/*|.claude/scripts/*|.claude/agents/*|.claude/styles/*|.claude/templates/*|.claude/*.yaml|.claude/*.yml|.claude/*.example)
             src="$SCRIPT_DIR/$f"
             dst="$WORKSPACE_DIR/$f"
             if is_author_mode && [ -f "$dst" ]; then
@@ -4454,6 +4856,8 @@ for f in "${NEW_FILES[@]}" "${UPDATED_FILES[@]}"; do
             fi
             mkdir -p "$(dirname "$dst")"
             if copy_platform_file_preserving_user_space "$src" "$dst" "$f"; then
+                # .claude/bin holds extension-less executables (guarded-rm, issue #940)
+                case "$f" in .claude/bin/*) chmod +x "$dst" ;; esac
                 echo "  ✓ $f → workspace"
             fi
             ;;
@@ -4819,51 +5223,9 @@ validate_no_install_values_in_applied_additions() {
     # Детерминированно в обоих окружениях (peer-review Codex, 2026-08-24-07):
     # python-путь и shell-фоллбек дают одинаковый результат на одном манифесте
     # — P0 не остаётся воспроизводимым только в окружениях без python3/python.
+    # Upstream manifest of this run; the reader itself is manifest_sha256_of (top level).
     manifest_sha256_for_path() {
-        local want="$1"
-        if py_available; then
-            "$PY_BIN" - "$MANIFEST" "$want" <<'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1], encoding='utf-8') as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(1)
-matches = [e.get('sha256') for e in data.get('files', []) if e.get('path') == sys.argv[2]]
-uniq = set(m for m in matches if m)
-if len(uniq) != 1:
-    sys.exit(1)
-print(uniq.pop())
-PYEOF
-            return $?
-        fi
-        # Shell-фоллбек (нет python3/python): не общий JSON-парсер — опирается
-        # на фиксированный layout нашего же generate-manifest.sh
-        # (json.dump(indent=2), "path" непосредственно перед "sha256" в одном
-        # объекте, один ключ на строку). Если формат манифеста когда-нибудь
-        # разъедется с этим предположением — E2E-тест на no-python окружение
-        # это поймает (WP-529 Ф16, В3 codex).
-        awk -v want="$want" '
-            /"path"[[:space:]]*:/ {
-                line = $0
-                sub(/^[^"]*"path"[[:space:]]*:[[:space:]]*"/, "", line)
-                sub(/".*$/, "", line)
-                cur_path = line
-                next
-            }
-            /"sha256"[[:space:]]*:/ && cur_path == want {
-                line = $0
-                sub(/^[^"]*"sha256"[[:space:]]*:[[:space:]]*"/, "", line)
-                sub(/".*$/, "", line)
-                if (found && line != found_val) { ambiguous = 1 }
-                found = 1
-                found_val = line
-            }
-            END {
-                if (found && !ambiguous) { print found_val; exit 0 }
-                exit 1
-            }
-        ' "$MANIFEST"
+        manifest_sha256_of "$MANIFEST" "$1"
     }
 
     for fpath in "${APPLIED_PATHS[@]}"; do
@@ -5006,7 +5368,16 @@ if [ "${#CLAUDE_SILENT_LOSS_FILES[@]}" -gt 0 ]; then
     echo "  Пропавшие строки — в предупреждениях выше. Сверьте вручную и закоммитьте отдельно."
 fi
 
-if $CLAUDE_CONFLICT_DETECTED || [ "${#CLAUDE_BASE_MISSING_FILES[@]}" -gt 0 ] || [ "${#CLAUDE_SILENT_LOSS_FILES[@]}" -gt 0 ]; then
+# WP-7 F193: git failed, no merge was made (see claude_merge_failed).
+if [ "${#CLAUDE_MERGE_FAILED_FILES[@]}" -gt 0 ]; then
+    echo ""
+    echo "⚠ CLAUDE.md не тронут (git не выдал слияния) в:"
+    for cf in "${CLAUDE_MERGE_FAILED_FILES[@]}"; do echo "  - $cf"; done
+    echo "  Проверьте, что git работает (git --version), и перезапустите update.sh: файл не менялся, повтор безопасен."
+fi
+
+if $CLAUDE_CONFLICT_DETECTED || [ "${#CLAUDE_BASE_MISSING_FILES[@]}" -gt 0 ] || [ "${#CLAUDE_SILENT_LOSS_FILES[@]}" -gt 0 ] \
+    || [ "${#CLAUDE_MERGE_FAILED_FILES[@]}" -gt 0 ]; then
     exit "$EXIT_CONFLICT"
 fi
 

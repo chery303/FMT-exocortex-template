@@ -506,7 +506,7 @@ GitHub уже может остаться созданный публичный 
 - Напиши: `.Моя мысль про архитектуру` (точка + текст)
 - Или перешли/ответь на любое сообщение с `.`
 
-Заметка попадёт в `DS-strategy/inbox/fleeting-notes.md`. Стратег разберёт её вечером (Note-Review, 23:00) и классифицирует: задача → план, знание → captures, идея → на обсуждение.
+Заметка попадёт в `DS-strategy/inbox/fleeting-notes.md` и будет ждать там вашего решения. Сама по вечерам заметки не разбираются. Когда захотите, разберите их одним из трёх способов: откройте секцию «Разбор заметок» в плане дня (мини-разбор в Открытии дня, там перечислены заметки, ждущие решения); в сессии Claude Code попросите: «Разбери заметки по инструкции `roles/strategist/prompts/note-review.md`» (агент пройдёт все шаги); или запустите в терминале `bash ~/IWE/FMT-exocortex-template/roles/strategist/scripts/strategist.sh note-review` (из терминала идёт без чата: только пометки `✅предложено` и предложения). Стратег предложит, куда отнести каждую: задача → план, знание → captures, идея → на обсуждение. Убрать заметку из ящика и перенести в архив он может только по вашему слову в живой сессии.
 
 ## Этап 4: WakaTime — трекинг времени (10 мин, опционально)
 
@@ -723,12 +723,13 @@ schtasks /create /tn "ExocortexWake" /tr "wsl ~/IWE/scripts/scheduler.sh dispatc
 | **Утро (Вт-Вс)** | Стратег | Собирает коммиты за вчера, формирует план дня | `DS-strategy/current/DayPlan YYYY-MM-DD.md` |
 | **Утро (Пн)** | Стратег | Готовит черновик недельного плана + повестку сессии | `DS-strategy/current/WeekPlan W{N}.md` |
 | **Каждые 3 часа** | Экстрактор* | Проверяет inbox (заметки, captures) → предлагает знания в Pack | `DS-strategy/inbox/extraction-reports/` |
-| **Вечер (23:00)** | Стратег | Note-Review классифицирует заметки из Telegram | Целевые документы в DS-strategy |
 | **Ночь (00:00)** | Синхронизатор* | Code-scan — обзор изменений в downstream-репо | `DS-strategy/current/CodeScan YYYY-MM-DD.md` |
 | **Ночь (Вс→Пн)** | Стратег | Week Review — итоги недели | `DS-strategy/current/WeekReport W{N} YYYY-MM-DD.md` |
 | **Утро (06:00)** | Синхронизатор* | Daily report — сводка ночных задач | `DS-agent-workspace/scheduler/reports/` (или `DS-strategy/current/` если без Agent Workspace) |
 
 > *Экстрактор и Синхронизатор работают только если установлены (Этап 1.4).*
+
+Разбор заметок из Telegram в этот список не входит: автоматически он не запускается. Его запускаете вы: секция «Разбор заметок» в плане дня, просьба разобрать заметки в сессии Claude Code или команда `note-review` из терминала (ниже, в «Ручном запуске»).
 
 ### Ручной запуск (если нужно)
 
@@ -740,7 +741,7 @@ bash ~/IWE/FMT-exocortex-template/roles/strategist/scripts/strategist.sh day-pla
 # Сессия стратегирования (интерактивная)
 bash ~/IWE/FMT-exocortex-template/roles/strategist/scripts/strategist.sh strategy-session
 
-# Обзор заметок
+# Обзор заметок: из терминала только пометки и предложения; архив и очистка только в сессии Claude Code, по вашему слову
 bash ~/IWE/FMT-exocortex-template/roles/strategist/scripts/strategist.sh note-review
 
 # Итоги недели

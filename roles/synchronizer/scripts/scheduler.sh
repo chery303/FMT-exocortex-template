@@ -25,13 +25,6 @@ elif command -v systemd-inhibit &>/dev/null; then
     trap 'kill $_INHIBIT_PID 2>/dev/null' EXIT
 fi
 
-# Cross-platform date offset: portable_date_offset <days_back> <format>
-portable_date_offset() {
-    local days="$1"
-    local fmt="${2:-%Y-%m-%d}"
-    date -v-${days}d +"$fmt" 2>/dev/null || date -d "$days days ago" +"$fmt" 2>/dev/null
-}
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SYNC_DIR="$(dirname "$SCRIPT_DIR")"
 STATE_DIR="$HOME/.local/state/exocortex"
@@ -240,24 +233,13 @@ dispatch() {
         ran=1
     fi
 
-    # --- Стратег: note-review (22:00+) ---
-    if (( 10#$HOUR >= 22 )) && ! ran_today "strategist-note-review"; then
-        log "→ strategist note-review (catch-up: hour=$HOUR)"
-        if run_strategist_scenario "note-review"; then
-            mark_done "strategist-note-review"
-        fi
-        ran=1
-    elif (( 10#$HOUR < 12 )); then
-        local yesterday
-        yesterday=$(portable_date_offset 1)
-        if [ -n "$yesterday" ] && [ ! -f "$STATE_DIR/strategist-note-review-$yesterday" ]; then
-            log "→ strategist note-review (catch-up for yesterday $yesterday)"
-            if run_strategist_scenario "note-review"; then
-                echo "$(date '+%H:%M:%S') catch-up" > "$STATE_DIR/strategist-note-review-$yesterday"
-            fi
-            ran=1
-        fi
-    fi
+    # --- Стратег: note-review — no scheduled runs (template owner's decision, July 2026) ---
+    # Notes are reviewed ONLY by hand, in a live session with the pilot (e.g. the Day Open
+    # "Разбор заметок" section). The nightly run kept stripping bold and archiving notes without
+    # a pilot decision, so BOTH scheduler paths are gone: the evening run (22:00+) and the
+    # morning catch-up for "yesterday". A manual `strategist.sh note-review` from a terminal
+    # still works, but it has no chat: it only marks notes and writes proposals, the model archives
+    # nothing (only the cleanup safety net may archive a note whose bold the pilot already removed).
 
     # --- Синхронизатор: code-scan (ежедневно) ---
     if ! ran_today "synchronizer-code-scan"; then

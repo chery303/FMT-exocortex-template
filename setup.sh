@@ -792,18 +792,20 @@ else
 fi
 
 # === 4b. Propagate skills, hooks, rules, lib, config, detectors, scripts, styles to workspace ===
-echo "[4b] Installing skills, hooks, rules, rules-lazy, lib, config, detectors, scripts, styles..."
+echo "[4b] Installing skills, hooks, rules, rules-lazy, lib, bin, config, detectors, scripts, styles..."
 if $DRY_RUN; then
-    echo "  [DRY RUN] Would copy .claude/{skills,hooks,rules,rules-lazy,lib,config,detectors,scripts,agents,styles}/ → $WORKSPACE_DIR/.claude/"
+    echo "  [DRY RUN] Would copy .claude/{skills,hooks,rules,rules-lazy,lib,bin,config,detectors,scripts,agents,styles}/ → $WORKSPACE_DIR/.claude/"
 else
     mkdir -p "$WORKSPACE_DIR/.claude"
     # lib/config/detectors — runtime dependencies капчер-шины (capture-bus.sh) и детекторов
     # scripts — требуется скиллами (напр. load-extensions.sh)
     # styles — дисциплина языковых стилей (WP-412)
     # rules-lazy — lazy-loaded rule expansions (role-prefixes-full), parity with update.sh
-    for subdir in skills hooks rules rules-lazy lib config detectors scripts agents styles templates; do
+    for subdir in skills hooks rules rules-lazy lib bin config detectors scripts agents styles templates; do
         if [ -d "$TEMPLATE_DIR/.claude/$subdir" ]; then
             cp -r "$TEMPLATE_DIR/.claude/$subdir" "$WORKSPACE_DIR/.claude/"
+            # .claude/bin holds extension-less executables (guarded-rm, issue #940)
+            [ "$subdir" = bin ] && chmod +x "$WORKSPACE_DIR/.claude/bin/"* 2>/dev/null || true
             echo "  ✓ .claude/$subdir/ → $WORKSPACE_DIR/.claude/$subdir/"
         fi
     done
@@ -1221,12 +1223,6 @@ adopt_existing_governance_repo() {
         echo "  Fix: inspect and clean it up (or rename it aside), then re-run setup.sh."
         exit 1
     fi
-    if $DRY_RUN; then
-        echo "  [DRY RUN] Remote $GITHUB_USER/$GOVERNANCE_REPO exists → would clone it into $MY_STRATEGY_DIR"
-        echo "  [DRY RUN] Would verify governance markers: ${GOVERNANCE_MARKERS[*]}"
-        generate_executor_catalog_for_governance
-        return
-    fi
     echo "  Remote $GITHUB_USER/$GOVERNANCE_REPO already exists (created elsewhere, e.g. from the browser) — adopting it."
     if ! gh repo clone "$GITHUB_USER/$GOVERNANCE_REPO" "$MY_STRATEGY_DIR" -- --quiet 2>/dev/null; then
         echo "  ERROR: could not clone $GITHUB_USER/$GOVERNANCE_REPO. Check network/access and re-run."
@@ -1259,17 +1255,21 @@ adopt_existing_governance_repo() {
     fi
 }
 
+# A dry run must not touch the network (test_fresh_seed_reproduction.sh pins this
+# with tripwire binaries), so the remote probe is skipped there and the preview
+# names both outcomes instead of guessing one (issue #956).
+# adopt_existing_governance_repo consequently only ever runs for real.
 if [ -d "$MY_STRATEGY_DIR/.git" ]; then
     echo "  $GOVERNANCE_REPO already exists as git repo."
     generate_executor_catalog_for_governance
-elif [ -d "$STRATEGY_TEMPLATE" ] && remote_governance_repo_exists; then
+elif [ -d "$STRATEGY_TEMPLATE" ] && ! $DRY_RUN && remote_governance_repo_exists; then
     adopt_existing_governance_repo
 elif $DRY_RUN; then
     if [ -d "$STRATEGY_TEMPLATE" ]; then
         echo "  [DRY RUN] Would create $GOVERNANCE_REPO from seed/strategy → $MY_STRATEGY_DIR"
         echo "  [DRY RUN] Would init git repo + initial commit"
         if ! $CORE_ONLY; then
-            echo "  [DRY RUN] Would create GitHub repo: $GITHUB_USER/$GOVERNANCE_REPO (private)"
+            echo "  [DRY RUN] Проверит GitHub: примет существующий репозиторий $GITHUB_USER/$GOVERNANCE_REPO или создаст новый (private)"
         fi
     else
         echo "  [DRY RUN] Would create minimal $GOVERNANCE_REPO (seed/strategy not found)"
