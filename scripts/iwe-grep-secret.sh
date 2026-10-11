@@ -11,6 +11,13 @@
 #   iwe-grep-secret.sh '<secret-value>' [--layer env|cloud|pg|smoke|all]
 #   echo '<secret-value>' | iwe-grep-secret.sh --layer env
 #
+# Env vars:
+#   IWE_WORKSPACE          — local IWE workspace root (default: $HOME/IWE)
+#   IWE_SECRET_SCAN_HOSTS  — space-separated remote hosts to scan via ssh for
+#                            Layer 1 (/etc/iwe/env, systemd units, ~/IWE/**/.env*).
+#                            Unset/empty = skip remote scanning entirely (no
+#                            ssh attempted, no wait).
+#
 # Exit codes:
 #   0 — N = 0 (ни одного hit)
 #   1 — N ≥ 1 (есть hits, требуется ручная проверка)
@@ -107,7 +114,7 @@ case "$LAYER_FILTER" in
   *) die "Invalid layer: $LAYER_FILTER. Use: env, cloud, pg, smoke, all" ;;
 esac
 
-# ── Layer 1: Env-файлы (local + tsekh-1) ─────────────────────────────────
+# ── Layer 1: Env-файлы (local + optional remote hosts) ───────────────────
 scan_layer_env() {
   log_layer_start "1 (env files)"
   local hits=0
@@ -131,7 +138,8 @@ scan_layer_env() {
   done
 
   # Рекурсивный grep по IWE (только .env файлы, исключая node_modules и т.п.)
-  if [[ -d "$HOME/IWE" ]]; then
+  local iwe_ws="${IWE_WORKSPACE:-$HOME/IWE}"
+  if [[ -d "$iwe_ws" ]]; then
     while IFS= read -r -d '' f; do
       local c
       c=$(grep -cF "$SECRET_VALUE" "$f" 2>/dev/null || true)
@@ -139,48 +147,55 @@ scan_layer_env() {
         printf "  %-20s %-40s %s\n" "Layer 1" "$f" "${RED}${c} hits${NC}"
         ((hits += c)) || true
       fi
-    done < <(find "$HOME/IWE" -type f \( -name ".env*" -o -name "secrets*" \) \
+    done < <(find "$iwe_ws" -type f \( -name ".env*" -o -name "secrets*" \) \
       ! -path "*/node_modules/*" ! -path "*/.venv/*" ! -path "*/venv/*" \
       ! -path "*/target/*" ! -path "*/__pycache__/*" \
       -print0 2>/dev/null)
   fi
 
-  # tsekh-1 через ssh
-  if command -v ssh &>/dev/null; then
-    local ssh_hits=0
-    # Проверяем доступность tsekh-1
-    if ssh -o ConnectTimeout=5 -o BatchMode=yes tsekh-1 "echo ok" &>/dev/null; then
-      # /etc/iwe/env
-      local c1
-      c1=$(ssh -o ConnectTimeout=5 tsekh-1 "grep -cF '$SECRET_VALUE' /etc/iwe/env 2>/dev/null || echo 0" 2>/dev/null || echo 0)
-      if [[ "$c1" -gt 0 ]]; then
-        printf "  %-20s %-40s %s\n" "Layer 1" "tsekh-1:/etc/iwe/env" "${RED}${c1} hits${NC}"
-        ((ssh_hits += c1)) || true
-      fi
+  # Remote hosts via ssh — optional. IWE_SECRET_SCAN_HOSTS is a
+  # space-separated list of reachable hostnames/ssh-aliases; unset/empty
+  # skips remote scanning entirely (no ssh attempted, nothing to configure
+  # for a generic install).
+  if [[ -n "${IWE_SECRET_SCAN_HOSTS:-}" ]]; then
+    if command -v ssh &>/dev/null; then
+      local ssh_hits=0
+      local remote_host
+      for remote_host in ${IWE_SECRET_SCAN_HOSTS}; do
+        if ssh -o ConnectTimeout=5 -o BatchMode=yes "$remote_host" "echo ok" &>/dev/null; then
+          # /etc/iwe/env
+          local c1
+          c1=$(ssh -o ConnectTimeout=5 "$remote_host" "grep -cF '$SECRET_VALUE' /etc/iwe/env 2>/dev/null || echo 0" 2>/dev/null || echo 0)
+          if [[ "$c1" -gt 0 ]]; then
+            printf "  %-20s %-40s %s\n" "Layer 1" "${remote_host}:/etc/iwe/env" "${RED}${c1} hits${NC}"
+            ((ssh_hits += c1)) || true
+          fi
 
-      # systemd unit files
-      local c2
-      c2=$(ssh -o ConnectTimeout=5 tsekh-1 "grep -rcF '$SECRET_VALUE' /etc/systemd/system/ 2>/dev/null | awk -F: '{s+=\$2} END {print s+0}'" 2>/dev/null || echo 0)
-      if [[ "$c2" -gt 0 ]]; then
-        printf "  %-20s %-40s %s\n" "Layer 1" "tsekh-1:/etc/systemd/system/" "${RED}${c2} hits${NC}"
-        ((ssh_hits += c2)) || true
-      fi
+          # systemd unit files
+          local c2
+          c2=$(ssh -o ConnectTimeout=5 "$remote_host" "grep -rcF '$SECRET_VALUE' /etc/systemd/system/ 2>/dev/null | awk -F: '{s+=\$2} END {print s+0}'" 2>/dev/null || echo 0)
+          if [[ "$c2" -gt 0 ]]; then
+            printf "  %-20s %-40s %s\n" "Layer 1" "${remote_host}:/etc/systemd/system/" "${RED}${c2} hits${NC}"
+            ((ssh_hits += c2)) || true
+          fi
 
-      # IWE .env на tsekh-1
-      local c3
-      c3=$(ssh -o ConnectTimeout=5 tsekh-1 "find ~/IWE -type f \( -name '.env*' -o -name 'secrets*' \) ! -path '*/node_modules/*' -print0 2>/dev/null | xargs -0 grep -cF '$SECRET_VALUE' 2>/dev/null | awk -F: '{s+=\$2} END {print s+0}'" 2>/dev/null || echo 0)
-      if [[ "$c3" -gt 0 ]]; then
-        printf "  %-20s %-40s %s\n" "Layer 1" "tsekh-1:~/IWE/**/.env" "${RED}${c3} hits${NC}"
-        ((ssh_hits += c3)) || true
-      fi
+          # IWE .env на удалённом хосте
+          local c3
+          c3=$(ssh -o ConnectTimeout=5 "$remote_host" "find ~/IWE -type f \( -name '.env*' -o -name 'secrets*' \) ! -path '*/node_modules/*' -print0 2>/dev/null | xargs -0 grep -cF '$SECRET_VALUE' 2>/dev/null | awk -F: '{s+=\$2} END {print s+0}'" 2>/dev/null || echo 0)
+          if [[ "$c3" -gt 0 ]]; then
+            printf "  %-20s %-40s %s\n" "Layer 1" "${remote_host}:~/IWE/**/.env" "${RED}${c3} hits${NC}"
+            ((ssh_hits += c3)) || true
+          fi
+        else
+          warn "${remote_host} недоступен по ssh (Layer 1 incomplete for this host)"
+          ((INFRA_ERRORS++)) || true
+        fi
+      done
+      ((hits += ssh_hits)) || true
     else
-      warn "tsekh-1 недоступен по ssh (Layer 1 incomplete)"
+      warn "ssh не установлен (IWE_SECRET_SCAN_HOSTS задан, но Layer 1 remote hosts skipped)"
       ((INFRA_ERRORS++)) || true
     fi
-    ((hits += ssh_hits)) || true
-  else
-    warn "ssh не установлен (Layer 1 tsekh-1 skipped)"
-    ((INFRA_ERRORS++)) || true
   fi
 
   log_layer_done "1" "$hits"

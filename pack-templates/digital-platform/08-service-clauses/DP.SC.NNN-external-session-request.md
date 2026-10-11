@@ -230,17 +230,17 @@ finalized_at: ISO8601
 | Вариант | Где запускается Egress | Подходит для | Ограничение |
 |---------|----------------------|-------------|------------|
 | **Mac-local (MVP)** | launchd на машине пилота | Пилот за компьютером | Требует открытый Mac |
-| **tsekh-1 (пилот, Post-MVP)** | systemd на сервере пилота (всегда включён) | Пилот в дороге без Mac | `claude -p` (headless, без VS Code Local Gateway) |
+| **Удалённый сервер (пилот, Post-MVP)** | systemd на сервере пилота (всегда включён) | Пилот в дороге без Mac | `claude -p` (headless, без VS Code Local Gateway) |
 | **Per-machine (community)** | launchd/systemd на машине пользователя | Каждый пользователь IWE | Инсталляция per-machine |
 
-**Примечание:** tsekh-1-вариант теряет Local Gateway (открытые файлы, peer-координация) — только headless `claude -p`. Для пилота это приемлемо (полная среда — на Mac). ArchGate при переходе к community-tier.
+**Примечание:** вариант с удалённым сервером теряет Local Gateway (открытые файлы, peer-координация) — только headless `claude -p`. Для пилота это приемлемо (полная среда — на Mac). ArchGate при переходе к community-tier.
 
 ---
 
 ## Post-MVP (Future)
 
 - **Eager-pull:** GitHub webhook → tailscale funnel → локальный HTTP endpoint. Снижает git-sync latency с avg 7.5с до <1с.
-- **tsekh-1 always-on Egress** для пилота: systemd unit вместо launchd, без зависимости от включённого Mac.
+- **Удалённый always-on Egress** для пилота: systemd unit вместо launchd, без зависимости от включённого Mac.
 - **Голосовые ходы:** Telegram voice message → STT → ход в thread.
 
 ---

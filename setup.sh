@@ -354,6 +354,49 @@ iwe_claude_project_slug() {
     printf '%s' "$path" | sed 's/[^A-Za-z0-9]/-/g'
 }
 
+# hash_file FILE — the file's sha256, as update.sh computes it.
+# KEEP IN SYNC with update.sh — the same function body; setup/test-update-edge-cases.sh (T47) fails
+# when the copies diverge.
+hash_file() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        sha256sum "$1" | cut -d' ' -f1
+    fi
+}
+
+# memory_record_put FILE KEY HASH — the record of installed memory versions
+# ($WORKSPACE_DIR/.memory-deployed.tsv, one "key<TAB>sha256" line per file): afterwards its line for
+# KEY says HASH. update.sh reads it to tell a memory copy nobody changed from an edited one (issues
+# #965/#967). Written through a temporary file and mv; a record that is a link, no regular file or
+# unreadable is left as it is; returns non-zero, without a word, when it does not write.
+# KEEP IN SYNC with update.sh — the same function body; setup/test-update-edge-cases.sh (T47) fails
+# when the copies diverge.
+memory_record_put() {
+    local file="$1" key="$2" hash="$3" tmp line value tab
+    tab=$(printf '\t')
+    case "$hash" in *[!0-9a-f]*|'') return 1 ;; esac
+    [ "${#hash}" -eq 64 ] || return 1
+    if [ -L "$file" ] || { [ -e "$file" ] && { [ ! -f "$file" ] || [ ! -r "$file" ]; }; }; then
+        return 1
+    fi
+    tmp=$(mktemp "$file.XXXXXX" 2>/dev/null) || return 1
+    if [ -f "$file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in *"$tab"*) ;; *) continue ;; esac
+            value="${line##*"$tab"}"
+            case "$value" in *[!0-9a-f]*|'') continue ;; esac
+            [ "${#value}" -eq 64 ] || continue
+            [ "${line%"$tab"*}" = "$key" ] || printf '%s\n' "$line"
+        done < "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    if printf '%s\t%s\n' "$key" "$hash" >> "$tmp" && mv -f "$tmp" "$file"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 CLAUDE_PROJECT_SLUG="$(iwe_claude_project_slug "$WORKSPACE_DIR")"
 
 # === Governance repo contract (WP-560 Ф5-Phase-2) ===
@@ -703,9 +746,11 @@ fi
 echo "[3/6] Installing memory..."
 CLAUDE_MEMORY_DIR="$HOME/.claude/projects/$CLAUDE_PROJECT_SLUG/memory"
 if $DRY_RUN; then
-    MEM_COUNT=$(ls "$TEMPLATE_DIR/memory/"*.md 2>/dev/null | wc -l | tr -d ' ')
-    YAML_COUNT=$(ls "$TEMPLATE_DIR/memory/"*.yaml "$TEMPLATE_DIR/memory/"*.yml 2>/dev/null | wc -l | tr -d ' ')
-    echo "  [DRY RUN] Would copy $MEM_COUNT .md + $YAML_COUNT .yaml/.yml memory files → $CLAUDE_MEMORY_DIR/"
+    # Recursive find, not a top-level glob: memory/ has nested paths (memory/reference/agent-core.md)
+    # that a "$TEMPLATE_DIR/memory/"*.md glob never matches (issue #1105).
+    MEM_COUNT=$(find "$TEMPLATE_DIR/memory" -type f -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+    YAML_COUNT=$(find "$TEMPLATE_DIR/memory" -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | wc -l | tr -d ' ')
+    echo "  [DRY RUN] Would copy $MEM_COUNT .md + $YAML_COUNT .yaml/.yml memory files (recursively) → $CLAUDE_MEMORY_DIR/"
     if [ ! -e "$WORKSPACE_DIR/memory" ]; then
         echo "  [DRY RUN] Would create symlink: $WORKSPACE_DIR/memory → $CLAUDE_MEMORY_DIR"
     else
@@ -713,12 +758,25 @@ if $DRY_RUN; then
     fi
 else
     mkdir -p "$CLAUDE_MEMORY_DIR"
-    cp "$TEMPLATE_DIR/memory/"*.md "$CLAUDE_MEMORY_DIR/"
-    # Deliver yaml/yml configs (e.g. day-rhythm-config.yaml) alongside .md files
-    for f in "$TEMPLATE_DIR/memory/"*.yaml "$TEMPLATE_DIR/memory/"*.yml; do
-        [ -f "$f" ] && cp "$f" "$CLAUDE_MEMORY_DIR/"
-    done
+    # issue #1105: recurse into memory/** instead of globbing only the top level, so nested
+    # files (memory/reference/agent-core.md) are delivered on a fresh install too — mirrors
+    # update.sh's relative-path delivery (issue #287/#294), which keeps nesting via
+    # "${fpath#memory/}" rather than basename, both in repair_pass() and in Step 6 propagation.
+    # issues #965/#967: record what was installed, so update.sh can later prove a copy nobody
+    # changed untouched and refresh it. A record that cannot be written only costs that proof.
+    MEMORY_RECORD_FAILED=false
+    while IFS= read -r -d '' f; do
+        rel="${f#"$TEMPLATE_DIR"/memory/}"
+        dst="$CLAUDE_MEMORY_DIR/$rel"
+        mkdir -p "$(dirname "$dst")"
+        cp "$f" "$dst"
+        memory_record_put "$WORKSPACE_DIR/.memory-deployed.tsv" "memory/$rel" \
+            "$(hash_file "$dst")" || MEMORY_RECORD_FAILED=true
+    done < <(find "$TEMPLATE_DIR/memory" -type f \( -name "*.md" -o -name "*.yaml" -o -name "*.yml" \) -print0 2>/dev/null)
     echo "  Copied to $CLAUDE_MEMORY_DIR"
+    if $MEMORY_RECORD_FAILED; then
+        echo "  ВНИМАНИЕ: не удалось записать $WORKSPACE_DIR/.memory-deployed.tsv; update.sh будет отличать нетронутые файлы памяти от изменённых по другим признакам." >&2
+    fi
 
     # Create symlink so CLAUDE.md references (memory/protocol-open.md etc.) resolve from workspace root
     if [ ! -e "$WORKSPACE_DIR/memory" ]; then
@@ -1435,7 +1493,7 @@ else
     echo ""
     echo "Verify installation:"
     echo "  ✓ CLAUDE.md:   $WORKSPACE_DIR/CLAUDE.md"
-    echo "  ✓ Memory:      $CLAUDE_MEMORY_DIR/ ($(ls "$CLAUDE_MEMORY_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ') files)"
+    echo "  ✓ Memory:      $CLAUDE_MEMORY_DIR/ ($(find "$CLAUDE_MEMORY_DIR" -type f -name "*.md" 2>/dev/null | wc -l | tr -d ' ') files)"
     echo "  ✓ Symlink:     $WORKSPACE_DIR/memory → $CLAUDE_MEMORY_DIR"
     echo "  ✓ $GOVERNANCE_REPO: $MY_STRATEGY_DIR/"
     echo "  ✓ Template:    $TEMPLATE_DIR/"
@@ -1473,7 +1531,12 @@ else
         echo "  validate-режим setup.sh проверит: env-конфиг, обязательные файлы,"
         echo "  extensions, доступность MCP, структурные инварианты."
         echo ""
-        read -p "Запустить проверку сейчас? (y/n) " -n 1 -r || true
+        # #1010 F11: no question without a person to answer it (SETUP_CI or no terminal on stdin):
+        # `read` on an open stdin with no TTY waits forever.
+        REPLY=""
+        if [ -z "${SETUP_CI:-}" ] && [ -t 0 ]; then
+            read -p "Запустить проверку сейчас? (y/n) " -n 1 -r || true
+        fi
         echo ""
         if [[ ${REPLY:-} =~ ^[Yy]$ ]]; then
             echo ""

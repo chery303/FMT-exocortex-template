@@ -131,7 +131,7 @@ promote_one() {
     smoke_result=0
     # PATH inherited from the caller's own environment, not a hardcoded macOS list
     # (WP-484, 2026-07-28): the previous "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
-    # has no `date`, `git`, or `which` on NixOS (tsekh-1) — any promotion run from
+    # has no `date`, `git`, or `which` on NixOS (a pilot's remote server) — any promotion run from
     # that host hit exit 127 here regardless of the script being promoted, live-
     # reproduced blocking a WP-484 fix. env -i still clears everything else, so
     # the smoke test's own environment isolation is unchanged, only PATH now comes

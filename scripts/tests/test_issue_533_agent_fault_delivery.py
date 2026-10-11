@@ -499,22 +499,39 @@ harden_agent_fault_profile_after_update
     )
 
 
-def _run_update_day_open_backfill(
+def _run_update_governance_script_policy(
     workspace: Path,
     governance: str,
-    *,
-    extra_env: dict[str, str] | None = None,
+    relative_paths: tuple[str, ...],
 ) -> subprocess.CompletedProcess[str]:
+    """Run apply_governance_script_policy for RELATIVE_PATHS the way
+    run_post_apply_backfills_or_die does (WP-485 Ф17, 2026-10-05): content-based
+    decision against the template clone's own seed-path history, never a reason
+    to abort the rest of update.sh.
+    """
     script = (
-        _update_shell_function("atomic_copy_executable")
-        + _update_shell_function("agent_fault_git")
-        + _update_shell_function("backfill_governance_seed_script")
-        + _update_shell_function("backfill_day_open_fault_reader")
+        _update_shell_function("hash_file")
+        + _update_shell_function("atomic_copy_executable")
+        + _update_shell_function("memory_record_put")
+        + _update_shell_function("memory_record_get")
+        + _update_shell_function("memory_old_hash")
+        + _update_shell_function("remember_memory_deployed")
+        + _update_shell_function("memory_reason_text")
+        + _update_shell_function("memory_copy_verdict")
+        + _update_shell_function("saving_cp_command")
+        + _update_shell_function("backup_governance_script_before_overwrite")
+        + _update_shell_function("apply_governance_script_policy")
+        + _update_shell_function("report_governance_script_policy_summary")
         + """
 SCRIPT_DIR="$1"
 WORKSPACE_DIR="$2"
 EFFECTIVE_GOVERNANCE_REPO="$3"
-backfill_day_open_fault_reader
+MEMORY_DEPLOYED_RECORD="$WORKSPACE_DIR/.memory-deployed.tsv"
+shift 3
+for relative_path in "$@"; do
+    apply_governance_script_policy "$relative_path" || true
+done
+report_governance_script_policy_summary
 """
     )
     return subprocess.run(
@@ -522,14 +539,14 @@ backfill_day_open_fault_reader
             "bash",
             "-c",
             script,
-            "issue-533-day-open-backfill",
+            "issue-533-governance-script-policy",
             str(ROOT),
             str(workspace),
             governance,
+            *relative_paths,
         ],
         capture_output=True,
         text=True,
-        env={**os.environ, **(extra_env or {})},
         check=False,
         timeout=20,
     )
@@ -599,55 +616,23 @@ def test_week_close_stats_documentation_names_one_exact_subject():
     assert commands.index("IWE_FAULT_SUBJECT_ID=claude-code") < stats_position
 
 
-def test_update_backfills_the_governance_reader_that_day_open_executes(
+def test_day_open_reader_runs_from_template_copy_not_governance_backfill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    workspace, governance_dir = _install_seed(tmp_path)
-    installed_reader = governance_dir / "scripts" / "day-open-llm-fill.py"
-    installed_reader.write_text(
-        "#!/usr/bin/env python3\nraise SystemExit('stale reader must be replaced')\n",
-        encoding="utf-8",
-    )
-    installed_reader.chmod(0o755)
-    subprocess.run(["git", "init", "-q", str(governance_dir)], check=True, timeout=10)
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "config", "user.name", "Issue 533 test"],
-        check=True,
-        timeout=10,
-    )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(governance_dir),
-            "config",
-            "user.email",
-            "issue-533@example.invalid",
-        ],
-        check=True,
-        timeout=10,
-    )
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "add", "--", "scripts/day-open-llm-fill.py"],
-        check=True,
-        timeout=10,
-    )
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "commit", "-qm", "old day-open reader"],
-        check=True,
-        timeout=10,
-    )
-
-    backfilled = _run_update_day_open_backfill(workspace, governance_dir.name)
-
-    assert backfilled.returncode == 0, backfilled.stdout + backfilled.stderr
-    assert installed_reader.read_bytes() == (
-        SEED / "scripts" / "day-open-llm-fill.py"
-    ).read_bytes()
-    assert stat.S_IMODE(installed_reader.stat().st_mode) & 0o111
+    """WP-485 Ф17 (2026-10-05): day-open-llm-fill.py is platform-owned. Day Open
+    executes it from $IWE_SCRIPTS (the template's own copy) on every installation
+    this repo's own ~/.iwe-paths and day-open-pipeline.sh resolve, so a second,
+    independently-aging copy under the governance repo was never load-bearing --
+    it only risked silently replacing a pilot's own committed, more-advanced
+    version with an older seed (the mechanism behind this issue's user-reported
+    incident: two different error texts because update.sh self-updated between
+    the user's two attempts). update.sh must no longer define or call a backfill
+    for this path at all.
+    """
     update_source = UPDATE.read_text(encoding="utf-8")
-    assert "if ! backfill_day_open_fault_reader" in update_source
+    assert "backfill_day_open_fault_reader" not in update_source
+    assert 'backfill_governance_seed_script "scripts/day-open-llm-fill.py"' not in update_source
     assert '"seed/strategy/scripts/day-open-llm-fill.py"' in (
         ROOT / "generate-manifest.sh"
     ).read_text(encoding="utf-8")
@@ -659,110 +644,49 @@ def test_update_backfills_the_governance_reader_that_day_open_executes(
             encoding="utf-8"
         )
 
+    workspace, governance_dir = _install_seed(tmp_path)
     env = _platform_env(workspace, governance_dir.name, tmp_path)
     env["IWE_FAULT_SUBJECT_KIND"] = "runtime"
-    env["IWE_FAULT_SUBJECT_ID"] = "runtime-updated-day-open"
-    fault = "обновлённый governance reader читает доставленный профиль"
+    env["IWE_FAULT_SUBJECT_ID"] = "runtime-template-day-open"
+    fault = "шаблонная копия читает доставленный профиль независимо от governance-репо"
     for _ in range(3):
-        recorded = _record(env, fault, subject_id="runtime-updated-day-open")
+        recorded = _record(env, fault, subject_id="runtime-template-day-open")
         assert recorded.returncode == 0, recorded.stdout + recorded.stderr
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    module_name = "issue_533_updated_governance_day_open"
-    spec = importlib.util.spec_from_file_location(module_name, installed_reader)
+    module_name = "issue_533_template_day_open_reader"
+    spec = importlib.util.spec_from_file_location(
+        module_name, ROOT / "scripts" / "day-open-llm-fill.py"
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     assert module.load_fault_profile() == f"🔴 [MAJOR | n=3] {fault}"
 
-    local_reader = b"#!/usr/bin/env python3\n# local governance customization\n"
-    installed_reader.write_bytes(local_reader)
-    refused = _run_update_day_open_backfill(workspace, governance_dir.name)
-    assert refused.returncode != 0
-    assert "локальные изменения" in refused.stderr
-    assert installed_reader.read_bytes() == local_reader
 
-
-def test_day_open_backfill_ignores_alternate_index_and_preserves_tracked_deletion(
-    tmp_path: Path,
-):
+def test_governance_script_policy_never_touches_day_open_reader(tmp_path: Path):
+    """Regression guard for the removal above: running the new
+    apply_governance_script_policy pass for the two files it still covers must
+    leave an unrelated, clearly-stale scripts/day-open-llm-fill.py in the
+    governance repo completely untouched -- no code path reaches it any more.
+    """
     workspace, governance_dir = _install_seed(tmp_path)
-    target = governance_dir / "scripts" / "day-open-llm-fill.py"
-    _init_git_repo(governance_dir)
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "add", "--", target.relative_to(governance_dir)],
-        check=True,
-        timeout=10,
-    )
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "commit", "-qm", "tracked reader"],
-        check=True,
-        timeout=10,
-    )
-    target.unlink()
-    real_index = governance_dir / ".git" / "index"
-    real_index_before = real_index.read_bytes()
-    real_index_mtime = real_index.stat().st_mtime_ns
-    alternate_index = tmp_path / "alternate-index"
-    redirected_env = {**os.environ, "GIT_INDEX_FILE": str(alternate_index)}
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "read-tree", "--empty"],
-        env=redirected_env,
-        check=True,
-        timeout=10,
-    )
-    alternate_before = alternate_index.read_bytes()
+    stale_reader = governance_dir / "scripts" / "day-open-llm-fill.py"
+    stale_bytes = b"#!/usr/bin/env python3\nraise SystemExit('must stay untouched')\n"
+    stale_reader.write_bytes(stale_bytes)
+    stale_reader.chmod(0o755)
+    stale_mtime = stale_reader.stat().st_mtime_ns
 
-    blocked = _run_update_day_open_backfill(
+    result = _run_update_governance_script_policy(
         workspace,
         governance_dir.name,
-        extra_env={"GIT_INDEX_FILE": str(alternate_index)},
+        ("scripts/update-derived-snapshot.py", "scripts/generate-executor-catalog.py"),
     )
 
-    assert blocked.returncode != 0
-    assert not target.exists()
-    assert real_index.read_bytes() == real_index_before
-    assert real_index.stat().st_mtime_ns == real_index_mtime
-    assert alternate_index.read_bytes() == alternate_before
-
-
-def test_day_open_backfill_refuses_tracked_deleted_uppercase_alias(
-    tmp_path: Path,
-):
-    workspace, governance_dir = _install_seed(tmp_path)
-    lowercase = governance_dir / "scripts" / "day-open-llm-fill.py"
-    uppercase = governance_dir / "scripts" / "DAY-OPEN-LLM-FILL.PY"
-    lowercase.rename(uppercase)
-    _init_git_repo(governance_dir)
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "config", "core.ignorecase", "true"],
-        check=True,
-        timeout=10,
-    )
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "add", "--", uppercase.relative_to(governance_dir)],
-        check=True,
-        timeout=10,
-    )
-    subprocess.run(
-        ["git", "-C", str(governance_dir), "commit", "-qm", "uppercase reader"],
-        check=True,
-        timeout=10,
-    )
-    uppercase.unlink()
-    index = governance_dir / ".git" / "index"
-    index_before = index.read_bytes()
-    index_mtime = index.stat().st_mtime_ns
-
-    blocked = _run_update_day_open_backfill(workspace, governance_dir.name)
-
-    assert blocked.returncode != 0
-    assert not lowercase.exists()
-    assert not uppercase.exists()
-    assert "case-insensitive tracked alias" in blocked.stderr
-    assert index.read_bytes() == index_before
-    assert index.stat().st_mtime_ns == index_mtime
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stale_reader.read_bytes() == stale_bytes
+    assert stale_reader.stat().st_mtime_ns == stale_mtime
 
 
 def test_update_atomically_replaces_blessed_historical_legacy_shims(tmp_path: Path):

@@ -29,15 +29,49 @@
 уведомление пользователям в боте генерируется как пересказ CHANGELOG и висит без выпуска
 до тех пор, пока кто-то не подведёт черту вручную.
 
-**`.github/workflows/weekly-release.yml`** — по расписанию (воскресенье 20:00 UTC) проверяет:
-непустая ли секция `[Unreleased]` в CHANGELOG.md? Если да — сам бампает patch-версию
-(`X.Y.Z` → `X.Y.(Z+1)`) в `update-manifest.json`, флашит `[Unreleased]` через
-`scripts/changelog-flush.sh` и коммитит. Коммит триггерит `release.yml` — тег и
-GitHub Release создаются автоматически.
+**`.github/workflows/weekly-release.yml`** по расписанию (воскресенье 20:00 UTC)
+проверяет `[Unreleased]` в CHANGELOG.md. Если там есть изменения, workflow
+увеличивает patch-версию (`X.Y.Z` → `X.Y.(Z+1)`), переносит заметки в новый
+раздел, пересобирает манифест и открывает PR из ветки `release/vX.Y.Z`.
+При ручном запуске этого workflow автор явно выбирает `release_type`:
+`patch` или `minor` (`0.Y.Z` → `0.(Y+1).0`). Тип выпуска не определяется по
+сообщениям коммитов; major-бамп остаётся ручной работой.
 
-**Ручной бамп по-прежнему возможен** для minor/major версий (новая функция, breaking change)
-или для внепланового выпуска — критерии готовности и шаги ниже не отменяются, авто-бамп
-их лишь применяет автоматически на patch-уровне раз в неделю вместо ожидания ручного решения.
+PR, созданный через `GITHUB_TOKEN`, ожидает разрешения на запуск проверок
+`pull_request`. Владелец с правом записи выбирает в PR **Approve workflows to
+run** и дожидается успешного `Validate Template` с обязательным
+`release-receipt` для актуального проверяемого коммита PR. Отдельный
+`workflow_dispatch` на релизной ветке может пройти, но [его jobs не
+засчитываются как обязательные проверки PR](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#checks-from-some-workflow-jobs-are-not-evaluated).
+Автор проверяет и сливает PR только после PR-проверок. Проверка на итоговом
+коммите `main` затем запускает `release.yml`; только после её успеха появляются
+тег и GitHub Release. Без слияния PR новая версия пользователям не доставляется.
+
+Для чувствительного patch-выпуска (обновлятор, безопасность, поведение агента)
+автор вручную запускает `post-release-audit.yml` с опубликованной версией:
+автоматическое напоминание создаётся лишь для версий `X.Y.0`.
+
+### Слит релизный PR, но нет тега
+
+1. Найти коммит слияния релизного PR и убедиться, что именно он находится в
+   `main`. Сверить на этом коммите версию в `update-manifest.json`, раздел
+   CHANGELOG и версионный значок README. Не запускать повторный бамп.
+2. Посмотреть `Validate Template` **для этого коммита**. Если проверка
+   не прошла из-за несвежего манифеста или значка, исправить их в новом PR
+   (`bash scripts/sync-version-badge.sh --fix`, `bash generate-manifest.sh`),
+   слить после проверок и дождаться зелёной проверки итогового коммита.
+3. Если итоговая проверка зелёная, а `release.yml` не создал тег, вручную
+   запустить `release.yml` с **явными** `version` и `sha` проверенного коммита:
+
+   ```bash
+   gh workflow run release.yml --ref main -f version="<X.Y.Z>" -f sha="<полный SHA проверенного коммита>"
+   ```
+
+   Ручной запуск обходит автоматическую связку с проверкой. Перед ним
+   обязательно сверить зелёный `Validate Template` именно для указанного SHA
+   и отсутствие тега `vX.Y.Z`; затем убедиться, что тег указывает на этот SHA,
+   а GitHub Release опубликован. Если тег уже есть, но Release отсутствует,
+   этот workflow его не восстановит: его шаг пропускает существующий тег.
 
 ---
 
@@ -83,39 +117,26 @@ fi
 
 > Fallback-ветка B удаляется через 2 релиза после восстановления нормальной тегальности.
 
-## Шаги бампа версии
+## Шаги ручного выпуска
 
-```bash
-# 1. Убедиться что CI зелёный, pull последние изменения
-git pull --rebase
+Для `patch` или `minor` сначала используйте ручной запуск Weekly Release с
+явным `release_type`. Для созданного ботом PR одобрите ожидающие запуска
+`pull_request` workflows, затем проверьте их результат и зелёный
+`release-receipt` на актуальном проверяемом коммите PR. Успех отдельного
+`workflow_dispatch` не заменяет этот шаг. После слияния тег и Release выпускает
+`release.yml` после проверки итогового коммита `main`.
 
-# 2. Определить новую версию (semver: patch = фиксы, minor = новый скилл/функция)
-NEW_VERSION="0.35.0"
+Для `major` или случая, когда автоматическая сборка PR не подходит:
 
-# 3. Забампать версию в манифесте
-python3 - "$NEW_VERSION" <<'EOF'
-import json, sys
-with open('update-manifest.json', encoding='utf-8') as f:
-    m = json.load(f)
-m['version'] = sys.argv[1]
-with open('update-manifest.json', 'w', encoding='utf-8') as f:
-    json.dump(m, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-print(f"version bumped to {sys.argv[1]}")
-EOF
-
-# 4. Добавить раздел в CHANGELOG.md: переименовать [Unreleased] → [X.Y.Z] и добавить новый [Unreleased]
-# Шаблон:
-# ## [X.Y.Z] — YYYY-MM-DD
-# ### Что нового
-# - краткое описание
-# ## [Unreleased]
-
-# 5. Commit + push
-git add update-manifest.json CHANGELOG.md
-git commit -m "chore: release $NEW_VERSION"
-git push
-```
+1. Начните с актуального `origin/main` в отдельной ветке `release/vX.Y.Z`.
+   Проверьте критерии готовности выше и назначьте версию явно.
+2. Обновите `update-manifest.json["version"]`, перенесите `[Unreleased]` в
+   раздел `[X.Y.Z]` через `scripts/changelog-flush.sh --version X.Y.Z`,
+   синхронизируйте значок (`scripts/sync-version-badge.sh --fix`) и пересоберите
+   манифест (`generate-manifest.sh`).
+3. Откройте PR. Сливайте его только после проверки релизной ветки, в том числе
+   `release-receipt`. Затем проверьте зелёный `Validate Template` итогового
+   коммита `main`, тег и опубликованный GitHub Release.
 
 ---
 

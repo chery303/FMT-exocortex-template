@@ -10,7 +10,7 @@ id: TASK-YYYY-MM-DD-<slug>
 kind: <kind>                         # одно из: analyze | scout | evolution | soak | retro | research | publish
 status: pending
 priority: P2                         # P0=critical, P1=high, P2=medium, P3=low
-agent: ccr-opus                      # ccr-opus | ccr-sonnet | tsekh-systemd | local-launchd
+agent: ccr-opus                      # ccr-opus | ccr-sonnet | remote-systemd | local-launchd
 template: <name>                     # имя файла в templates/ без .md
 created: YYYY-MM-DDTHH:MM:SS+03:00
 due: YYYY-MM-DDTHH:MM:SS+03:00

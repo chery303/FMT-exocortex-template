@@ -16,7 +16,7 @@ routing:
 
 # Day Open (протокол открытия дня)
 
-> **Роль:** R1 Стратег. **Два выхода:** DayPlan (git, 80+ строк) + compact dashboard (VS Code, 20-30 строк).
+> **Роль:** Плановик (DP.ROLE.066) ведёт план дня; Стратег (R1) подключается при пересмотре приоритетов. **Два выхода:** DayPlan (git, 80+ строк) + compact dashboard (VS Code, 20-30 строк).
 > **Порядок:** сначала DayPlan → потом compact. **Дата:** ПЕРВОЕ действие = `date`.
 > **Режим:** `memory/day-rhythm-config.yaml` → `interactive: false` = одним блоком, решения → «Требует внимания».
 > **Фильтр свежести:** issues, видео, заметки — за 2 дня. Urgent — всегда.
@@ -70,7 +70,7 @@ Day Open = протокол. Блокирующее требование — н�
 <!-- Детали (алгоритм классификации, формат): day-open-details.md § Шаг 4c -->
 
 ### 5. IWE за ночь (светофор)
-`cd "$IWE_TEMPLATE" && bash update.sh --check --fast` + проверка Base-репо (FPF, SPF, ZP) на отставание от origin. Обновления → «Требует внимания». Scout report не проревьюен → «Требует внимания».
+`(cd "$IWE_TEMPLATE" && bash update.sh --check --fast)` + проверка Base-репо (FPF, SPF, ZP) на отставание от origin. Обновления → «Требует внимания». Scout report не проревьюен → «Требует внимания».
 <!-- Детали (bash-скрипты): day-open-details.md § Шаг 5 -->
 
 ### 5a2. Видео

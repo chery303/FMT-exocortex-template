@@ -34,7 +34,15 @@ if [ -z "${WORKSPACE_DIR:-}" ]; then
     # When bootstrap is sourced from inside FMT-exocortex-template/.claude/,
     # going up two levels lands inside FMT, not in the real workspace root.
     _IWE_BOOTSTRAP_CANDIDATE="$(cd "$_IWE_BOOTSTRAP_DIR/../.." && pwd)"
-    if [[ "$(basename "$_IWE_BOOTSTRAP_CANDIDATE")" == "FMT-exocortex-template" ]]; then
+    # The template folder name is not an invariant (issue #933: a clone named
+    # e.g. "myexocortex"). The template is recognised by its own marker
+    # (update-manifest.json) AND by sitting inside a workspace (.exocortex.env
+    # in the parent, none inside it). Either alone is too broad: a partial
+    # layout must not lift WORKSPACE_DIR to an unrelated parent.
+    if [[ "$(basename "$_IWE_BOOTSTRAP_CANDIDATE")" == "FMT-exocortex-template" ]] \
+       || { [ -f "$_IWE_BOOTSTRAP_CANDIDATE/update-manifest.json" ] \
+            && [ ! -f "$_IWE_BOOTSTRAP_CANDIDATE/.exocortex.env" ] \
+            && [ -f "$_IWE_BOOTSTRAP_CANDIDATE/../.exocortex.env" ]; }; then
       WORKSPACE_DIR="$(cd "$_IWE_BOOTSTRAP_CANDIDATE/.." && pwd)"
     else
       WORKSPACE_DIR="$_IWE_BOOTSTRAP_CANDIDATE"
@@ -101,7 +109,9 @@ if [ -z "${IWE_SCRIPTS:-}" ]; then
   if [ -f "${WORKSPACE_DIR}/scripts/session-guard.sh" ] && [ ! -L "${WORKSPACE_DIR}/scripts/session-guard.sh" ]; then
     export IWE_SCRIPTS="${WORKSPACE_DIR}/scripts"
   else
-    export IWE_SCRIPTS="${WORKSPACE_DIR}/FMT-exocortex-template/scripts"
+    # IWE_TEMPLATE honours .exocortex.env (renamed template folder, #933);
+    # its default is the historical ${WORKSPACE_DIR}/FMT-exocortex-template.
+    export IWE_SCRIPTS="${IWE_TEMPLATE}/scripts"
   fi
 fi
 

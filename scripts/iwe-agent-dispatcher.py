@@ -79,7 +79,7 @@ _STOP_ACTIONS = frozenset(("stop", "cancel"))
 COMMIT_AUTHOR_NAME = os.environ.get("IWE_DISPATCHER_AUTHOR_NAME", "IWE Agent Dispatcher")
 COMMIT_AUTHOR_EMAIL = os.environ.get("IWE_DISPATCHER_AUTHOR_EMAIL", "noreply@example.com")
 
-# WP-358 follow-up Ф3 (2026-05-30): Y.2 deploy — stateless dispatcher на tsekh-1.
+# WP-358 follow-up Ф3 (2026-05-30): Y.2 deploy — stateless dispatcher на удалённом сервере.
 # При наличии GITHUB_TOKEN session-mode использует GitHub Contents API (read) +
 # Git Data API (atomic write blob+tree+commit+ref). Без TOKEN — fallback на старый
 # stateful session-mode через локальный клон (--workdir обязателен).
@@ -627,7 +627,7 @@ def _emit_event(event_type: str, ext_suffix: str, payload: dict) -> None:
     """WP-7 TGSH + WP-358 follow-up Ф3a: эмитит событие в event-gateway через urllib. Non-blocking.
 
     Заменяет shell-обёртку iwe_event_emit.sh — убирает зависимость от локального клона репо
-    на tsekh-1 (Y.2 deploy). Stdlib only.
+    на удалённом сервере (Y.2 deploy). Stdlib only.
     """
     import urllib.request as _urlreq
     import urllib.error as _urlerr
@@ -1968,9 +1968,9 @@ def session_mode_main(workdir: Path, dry_run: bool) -> None:
 #   - Read: GitHub Contents API + ETag conditional polling (304 не считается в rate-limit).
 #   - Write: GitHub Git Data API (blob → tree → commit → ref) — atomic commit thread+meta
 #     без локального клона. Retry-on-422 (non-fast-forward) — first-class.
-#   - Deploy: dispatcher.py выкатывается на tsekh-1 через scp/CI без локального клона репо.
+#   - Deploy: dispatcher.py выкатывается на удалённый сервер через scp/CI без локального клона репо.
 #   - Heartbeat: inline _emit_event (stdlib).
-#   - ETag cache: SQLite на tsekh-1 (~/.iwe/dispatcher-etags.db).
+#   - ETag cache: SQLite на удалённом сервере (~/.iwe/dispatcher-etags.db).
 # See: sessions/2026-05/2026-05-30-36-dispatcher-unification-cleanup/report.md §4.
 import hashlib
 
@@ -2242,7 +2242,7 @@ def _gh_atomic_commit(
 
 
 def _pick_tg_token(target_bot: str | None) -> str:
-    """Per-bot TG routing (backport tsekh, WP-358 Ф10.7).
+    """Per-bot TG routing (backport, WP-358 Ф10.7).
 
     target_bot: 'pilot' | 'prod' | None.
     Возвращает первый non-empty: TG_BOT_TOKEN_<TARGET>, TELEGRAM_BOT_TOKEN.
@@ -2256,7 +2256,7 @@ def _pick_tg_token(target_bot: str | None) -> str:
 
 
 def _send_tg_with_routing(chat_id: int, text: str, target_bot: str | None) -> bool:
-    """TG send с per-bot routing (backport tsekh)."""
+    """TG send с per-bot routing (backport, WP-358 Ф10.7)."""
     tok = _pick_tg_token(target_bot)
     if not tok:
         log(f"No TG token for target_bot={target_bot} — skip", "WARN")
@@ -2274,7 +2274,7 @@ def _send_tg_with_routing(chat_id: int, text: str, target_bot: str | None) -> bo
 
 
 def _detect_api_unavailable(stderr: str, stdout: str) -> tuple[bool, str | None]:
-    """Backport tsekh: detect API unavailable (5xx, network), extract recovery hint.
+    """Backport, WP-358 Ф10.7: detect API unavailable (5xx, network), extract recovery hint.
 
     Returns (is_unavailable, recovery_message).
     """
@@ -2294,7 +2294,7 @@ def _detect_api_unavailable(stderr: str, stdout: str) -> tuple[bool, str | None]
 
 def _write_system_reply(session_id: str, turn_n: int, reason: str,
                        message: str, recovery_hint: str | None = None) -> str:
-    """Backport tsekh: формат системного ответа для 4xx/5xx (вместо Claude-ответа)."""
+    """Backport, WP-358 Ф10.7: формат системного ответа для 4xx/5xx (вместо Claude-ответа)."""
     parts = [f"⚠️ Сервис временно недоступен: {reason}"]
     if recovery_hint:
         parts.append(f"Попробуйте {recovery_hint}.")

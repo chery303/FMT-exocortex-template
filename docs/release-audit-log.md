@@ -1,20 +1,38 @@
 # Release Audit Log
 
-> Adversarial post-release audits. Process: после каждого релиза auto-issue `Post-release adversarial audit: vX.Y.Z` сейчас мигрирует в эту таблицу. Триггер: `verify-before-promote.sh` warn gate при PASS-merge без записи в log.
+> Журнал результатов пострелизных состязательных аудитов. Workflow
+> `.github/workflows/post-release-audit.yml` создаёт issue-напоминание
+> автоматически при push `update-manifest.json` в main с версией x.y.0;
+> для patch его запускают вручную.
+> Здесь записывается результат аудита. Для каждой нерешённой существенной
+> находки нужна отдельная открытая задача со ссылкой из результата аудита.
+> Предупредительный `verify-before-promote.sh` не реализован.
 
 ## Назначение
 
-Adversarial audit — субагент или внешний пилот ищет регрессии вне покрытия:
-- 8 detectors (`integration-detectors.sh`)
-- smoke 14 (`integration-smoke.sh`)
-- promote-checks (`validate-fmt-scripts.sh`)
+Adversarial audit — проверяющий ищет регрессии вне текущих детекторов,
+проверок установки и `promote-checks` (`validate-fmt-scripts.sh`). Число
+выполненных проверок берётся из квитанции точного проверенного коммита.
 
-Любой найденный класс регрессий → новый detector в `integration-detectors.sh` (если воспроизводимо в CI) или smoke (если требует среды пилота).
+Каждая существенная подтверждённая находка получает ссылку на исполняемый
+детектор, фикстуру или тест среды с красным контролем на дефектном артефакте
+и зелёным результатом на кандидате. Если такого контроля нет, оговорку
+явно принимает владелец продукта или назначенный утверждающий выпуск,
+не автор находки. Запись должна содержать постоянную ссылку на его решение
+в issue, PR или записи решения, область, причину и условие пересмотра.
+Предложенная, но не принятая оговорка оставляет находку открытой. Каждая
+нерешённая существенная находка получает отдельный открытый issue в этом
+репозитории и ссылку на него в результате аудита. Напоминание об аудите можно
+закрыть лишь после создания таких задач; его закрытие не закрывает находки.
+Отдельная запись об аудите может быть завершена, но сама по себе не закрывает
+найденный дефект.
 
 ## Process
 
 ```
-release tag vX.Y.Z → auto-issue (legacy) | новая практика → запись здесь
+push update-manifest.json в main, версия x.y.0 → issue-напоминание автоматически
+patch → issue-напоминание при ручном запуске workflow
+аудит → запись результата здесь; нерешённая существенная находка → open issue
 ```
 
 | Поле | Описание |
@@ -26,12 +44,33 @@ release tag vX.Y.Z → auto-issue (legacy) | новая практика → з�
 | `result` | Cross-reference: PR/commit/issue с фиксами или `—` |
 | `notes` | Источник migration или дополнительная инфо |
 
+Пример применения к подтверждённой находке: ложный свободный план при отказе
+утреннего конвейера (#983) привёл к проверкам настоящего запуска
+`scripts/tests/test_issue_983_morning_alarm.sh` в PR #992. Независимый
+повтор теста из PR на родителе слияния #992 завершился кодом 1 и 64 отказами
+(в том числе свободный промпт при отказе конвейера); на коммите слияния #992
+он завершился кодом 0, 90 успешных проверок, 0 отказов. Не проверенные живой
+планировщик и Linux названы в PR отдельно. Эта квитанция относится только к
+свободному запасному плану и доставке тревоги: другие подпункты #983, включая
+сборку каркаса без шлюза модели, из неё не следуют. Она не доказывает покрытие
+всех прежних находок.
+
 ## Log
 
 | Version | Status | Date | Findings | Result | Notes |
 |---------|--------|------|----------|--------|-------|
-| v0.40.0 | **completed** | 2026-09-10 | 1 initial-misclassified blocker (false alarm, design intent already documented in code — see notes) + 4 confirmed important | GO (после фиксов) | issue #748 (sub-agent post-release verify), фиксы в PR #777 (issue-batch) + follow-up на ветке fix/wp570-audit-followup. Разбор: (1) «утечка» похожих на YooKassa-ключи в именах `scripts/tests/*.py` — false positive, `secret-bypass-lib.sh:70-84` уже документирует это намеренным fail-closed решением (WP-544) для длинных snake_case pytest-имён без source-context; не секрет, не инцидент; (2) `memory/MEMORY.md` (seed) — 2 мёртвые ссылки на файлы, удалённые в v0.27 → убраны; (3) `setup/detector-regex.sh` DETECTOR_07 не ловил quoted bare-литерал → регекс расширен + fixture; (4) `setup/smoke-test-fresh-install.sh` — 4 fail на NixOS (не regression шаблона — hardcoded `PATH=/usr/bin:/bin` не включал Nix-профиль + e2e-тесты наследовали PATH с посторонним git-wrapper дев-машины) → `SMOKE_CLEAN_PATH`, 49/0 после фикса; (5) `.claude/skills/lesson-close/` без парного `/lesson` → issue #778, оставлен пилоту (продуктовое решение, не техническая правка). |
-| v0.39.1 | **completed** | 2026-08-30 | 0 P0/P1, 3 low-severity (pre-existing, not caused by this delta) | GO | issue #576 (self-run by implementing agent, pilot-waived); independent context-isolated re-audit of the delta (PR #585 f896701 + PR #586 10c9732, personal-guide rename) — separate GO, findings: stale `docs/skills-catalog.md` (pre-existing), `org-dev/SKILL.md` references unrelated `PACK-personal/personal-guide/` path (needs owner confirmation it's intentionally distinct), `seed/strategy/scripts/day-open-scaffold.sh` not covered by manifest B2 (pre-existing gap) |
+| v0.41.6 | **completed** | 2026-10-05 | 5 существенных: F1 высокая (процесс), F2–F3 средние, F4 средняя-низкая, F5 низкая-средняя — [#1104](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1104), [#1105](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1105), [#1106](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1106), [#1107](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1107), [#1108](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1108) | [Слой 6: CAUTION](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1087#issuecomment-5993311098) | На теге 4ee4fef4: манифест/тег/релиз согласованы (793/0/0), чистая установка и обновление 0.41.5→0.41.6 зелёные, продуктовых P0/P1 нет. F1 — фикстура `test_issues_919_920_929_day_open.sh` без `strategy_day` упирается в дефолт `monday` и красит обязательный `validate`/`release-receipt` именно по понедельникам (независимо от продукта); фикс (`DAY_OPEN_FORCE_STRATEGY_DAY=1`) применён и подтверждён зелёным в #1103 в тот же день, условие пересмотра — плановый прогон main 06.10. F2 — свежая установка не получает `memory/reference/agent-core.md`. F3 — детектор 7 ложно-зелёный на 5 мутациях хардкода governance-репо. F4 — авторские константы (`tsekh-1`, `DS-Knowledge-Index`) минуют author-scan. F5 — голый `timeout` без проверки на штатном macOS. Ни одна находка не принята как оговорка; все пять остаются открытыми до своих фиксов. |
+| v0.41.5 | **completed** | 2026-10-05 | 7 находок F1–F7, 1 уже решена, 3 новые задачи, 3 добавлены как доказательство к находкам v0.41.6 | [Слой 6: CAUTION](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1083#issuecomment-5993362888) | На теге 60341824 (26f0f585): все обязательные гейты зелёные, манифест 792/792, свежая установка и extension points доказаны, P0/P1 нет. F1 — ложное предупреждение `update.sh` на больших `.iwe-runtime/`, уже исправлено в v0.41.6 (#1084, закрыт). F2 — `pack-creator-spf-guard.sh` не зарегистрирован ни в одном загрузчике хуков, заявленный PreToolUse-блок SPF/FPF fail-open, новая [#1109](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1109). F3/F4/F5 — тот же класс, что находки v0.41.6 на детекторе 7 и платформенной переносимости, с доп. доказательством (живой хардкод `dt-collect.sh:37`, доп. авторские константы, `flock`/bash-4 без shim) добавлены комментарием к [#1106](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1106)/[#1107](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1107)/[#1108](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1108), не продублированы отдельными задачами. F6 — битые ссылки в доставляемых skills/memory (setup-wakatime шаг 3 и другие), независимо замечены обоими аудитами на разных тегах, новая [#1110](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1110). F7 — `{{IWE_ROOT}}`/`{{MEMORY_DIR}}` без легенды в week-close/SKILL.md, новая [#1111](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1111). |
+| v0.41.4 | **completed** | 2026-10-04 | 0 новых существенных классов; исправление [#1072](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1072) подтверждено | [Слой 5: STABLE](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1077#issuecomment-5973802411); [слой 6: CAUTION](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1077#issuecomment-5973803726) | Опубликованный тег 41da1331 совпал с main CI и квитанцией publishable=true. Калибровка 21/21; красный/зелёный контроль #1072 12/12. Одноразовая установка v0.41.3→v0.41.4 через настоящий release-канал: 8 файлов обновлено, 1 удалён, 792/792 хешей и режимов совпали, 5 синтетических персонализаций сохранены, повтор без обновлений. Вызовов менеджеров служб не было. Shell-обёртка не заменяет VM для абсолютного вызова менеджера или замены PATH; личная приёмка Ф96 открыта. |
+| v0.41.3 | **completed** | 2026-10-03 | 1 существенный дефект границы аудита [#1072](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1072); 0 новых подтверждённых дефектов поведения #1067 | [Слой 5: 0 новых существенных](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1071#issuecomment-5973120428); [слой 6: BLOCKED](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1071#issuecomment-5973157100) | На опубликованном теге 774b0898 исправление #1067 прошло на доставленной копии; обновление v0.41.2→v0.41.3 через настоящий release-канал сохранило синтетические пользовательские файлы. Защитная обёртка одноразового аудита пропустила вызовы host-global `launchctl`; изменение службы хоста не доказано. #1071 сохраняет исторический BLOCKED; исправление #1072 и безопасный повтор записаны для v0.41.4. Старые #1002/#1005/#1006/#1032 остаются открыты. |
+| v0.41.2 | **completed** | 2026-10-03 | 1 новый существенный P1 [#1067](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1067) | [Слой 5: BLOCKED](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1066#issuecomment-5972449899); [слой 6: BLOCKED](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1066#issuecomment-5972436902) | На опубликованном теге 77fe2f2d после двух отказов week-review поставленный DayPlan показывает ложный зелёный статус, хотя отчёт не доставлен. Квитанция CI зелёная, но случай не покрыла. #1066 остаётся открытым до исправления и независимого повторного контроля; прежняя #1006 тоже открыта. |
+| v0.41.1 | **completed** | 2026-10-03 | 2 существенные: P1 #1060, P2 #1061 | [Слой 6: BLOCKED](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1059#issuecomment-5971646785) | [Слой 5: 2 classes found](https://github.com/TserenTserenov/FMT-exocortex-template/issues/1059#issuecomment-5971645767) на теге faccdf3c: выпускная квитанция зелёная, но установленное Открытие дня ложно красит отказ планировщика в зелёный и платформенному скиллу не доставлена обязательная карта. Обе задачи открыты; #1059 не закрыт. |
+| v0.41.0 | **completed** | 2026-10-02 | 0 blocker; 2 important регрессии выпуска, прежние находки и дефекты уведомлений | «Блокеров нет» по [комментарию пилота](https://github.com/TserenTserenov/FMT-exocortex-template/issues/998#issuecomment-5949272475) | Прогон пилота #998: две регрессии исправлены #999 и #1000; уведомления — #1001 с ограниченной проверкой; прежние находки — открытые #1002–#1006. Выпуск и обновления проверены в песочнице, как указано в #998; эти проверки не закрывают отдельные находки. |
+| v0.41.0 | **completed** | 2026-10-02 | 0 blocker; 4 important и 3 nice-to-have (сообщено отдельно) | «Не STABLE» по внешнему проверяющему; независимый повтор не записан | [Отдельный комментарий пользователя форка](https://github.com/TserenTserenov/FMT-exocortex-template/issues/998#issuecomment-5949629589): WSL2, обновление 0.40.2→0.41.0, `core.fileMode=false`. Миграционный путь вне манифеста, потеря `+x`, Python-литералы и Linux systemd; не складывать числа с прогоном пилота и не считать эти пункты закрытыми решением по нему. |
+| v0.40.0 | **completed** | 2026-09-10 | 0 blocker, 0 important, 5 nice-to-have (F1–F5) | STABLE по [первому прогону](https://github.com/TserenTserenov/FMT-exocortex-template/issues/748#issuecomment-5613470222) | F1 — пробел детектора, F2 — две мёртвые ссылки, F3 — устаревшие имена и счётчики, F4 — 7 из 24 `substituted` без `{{}}`, F5 — ссылка на несуществующий warn gate. Это отдельная ранняя оценка, без ложной тревоги YooKassa и NixOS. |
+| v0.40.0 | **completed** | 2026-09-10 | 1 первоначальная ложная тревога и 4 подтверждённых пункта | STABLE после технического follow-up по [позднему прогону пилота](https://github.com/TserenTserenov/FMT-exocortex-template/issues/748#issuecomment-5619310904) | Ложная «утечка» YooKassa — документированное fail-closed поведение. #779 убрал мёртвые ссылки, расширил DETECTOR_07 и починил smoke на NixOS (было 23 PASS/4 FAIL, стало 49/0). Четвёртый пункт, `/lesson-close` без `/lesson`, вынесен в #778 и решён пилотом позже в #845, а не в #779. |
+| v0.39.0 | **completed** | 2026-08-30 | 1 блокирующая регрессия #559 | BLOCKED, выпуск заменён v0.39.1 | [Прогон #576](https://github.com/TserenTserenov/FMT-exocortex-template/issues/576#issuecomment-5467737058): `RC_STEP_SKIPPED` не отображался в `main()` Day Close; необязательный пропуск давал код 1. Исправление #575. |
+| v0.39.1 | **completed** | 2026-08-30 | 0 новых P0/P1 в проверенном исправлении | GO по [прогону #576](https://github.com/TserenTserenov/FMT-exocortex-template/issues/576#issuecomment-5467737058) | Выпуск #577 после #575; аудит выполнял автор исправления по разрешению пилота, независимый повтор только рекомендован. #588 отдельно записал оценку дельты personal-guide #585/#586, но доступной исполняемой квитанции для заявленных там 3 прежних мелких наблюдений нет; не считать это независимым повтором выпуска. |
 | v0.34.1 | skipped-unverified | — | — | — | migrated from #133 |
 | v0.34.0 | skipped-unverified | — | — | — | migrated from #130 |
 | v0.33.x | skipped-unverified | — | — | — | migrated from #129, #127 |
@@ -40,21 +79,63 @@ release tag vX.Y.Z → auto-issue (legacy) | новая практика → з�
 | v0.30.x | skipped-unverified | — | — | — | migrated from #55, #54 |
 | v0.29.25 | skipped-unverified | — | — | — | migrated from #41 |
 | v0.29.x (legacy) | skipped-unverified | — | — | — | migrated from #15, #16, #18, #21, #22, #27, #32, #43, #44, #45, #52, #53 |
-| v0.29.x (round-2) | **completed** | 2026-05-06 | 40 | TESTING.md known limitations | confirmed via M1.6 #75 — 40 findings, all ✅ Fixed |
+| v0.29.x (round-2) | **completed** | 2026-05-06 | 40 заявленных находок | #75 фиксирует лишь часть статусов | [M1.6 #75](https://github.com/TserenTserenov/FMT-exocortex-template/issues/75) перечисляет 6 `Fixed` (C1–C4, H2–H3) и 3 `To verify` (H1, H4–H5). Полный список 40 и квитанция их закрытия в доступной записи отсутствуют; `TESTING.md` и указанный в #75 audit report сейчас не доставлены. |
+
+Квитанции и границы этих исторических записей:
+
+- Для v0.41.3 опубликованный аннотированный тег указывает на `774b08988bbd2dfb16a023d3e1bc2e83f87fd3cf`: [итоговый CI](https://github.com/TserenTserenov/FMT-exocortex-template/actions/runs/37149861369) дал `publishable=true`, [Release](https://github.com/TserenTserenov/FMT-exocortex-template/actions/runs/37150528108) прошёл. Независимый слой 5 сверил калибровку 9/9, валидатор 11/11, чистую установку 53/53, 792/792 хеша и десять классов; старые #1060/#1061 и #1067 на точном теге прошли зелёные контроли, прежний обход детектора остаётся в #1006. Слой 6 обновил одноразовую установку v0.41.2 через настоящий release-канал до v0.41.3: 792/792 файла и четыре синтетических пользовательских маркера сохранили нужные хеши, байты и режимы; повтор с заглушками менеджеров служб был без изменений (797 файлов/маркеров). На поставленной проекции тест #1067 дал 59 успехов против 33 ожидаемых отказов на v0.41.2. При первом обновлении обёртка `boundary-guard.sh` не отсекла host-global `launchctl`; безопасный красный контроль с заглушкой подтверждает канал, но не изменение существующей службы. Поэтому слой 6 дал BLOCKED, отдельная задача #1072 открыта; macOS smoke с реальным `launchctl`, живые WSL/systemd и личная установка не проверены. #1071 остаётся открытой, статус всего релиза STABLE не присвоен.
+- Для v0.41.2 проверен опубликованный annotated tag `77fe2f2d7d26743f1dd73c1ae0f5ee47b6f7da9b`, а не кандидат из PR: новый независимый проверяющий прошёл все 10 классов пострелизного промпта, калибровку защитной обёртки 9/9, валидатор 11/11 и smoke чистой установки 53/53; две проекции поставки совпали с 792/792 SHA манифеста. Отдельный проверяющий обновил одноразовую core-установку v0.41.1 через настоящий release-канал до v0.41.2: 7 файлов изменены, 1 удалён, три синтетических пользовательских маркера сохранили содержимое, размер и права; повторный запуск ничего не обновил и снова подтвердил 792 SHA. Старые красные контроли #1060/#1061 на поставленных файлах стали зелёными. Но новый красный контроль #1067 выявил ложный зелёный Scheduler/триаж после `FAILED`/`GAVE UP` недельного обзора и `dispatch completed`; чистый журнал тоже зелёный, добавление `WARN` делает дефектный журнал красным. [Main CI receipt](https://github.com/TserenTserenov/FMT-exocortex-template/actions/runs/37144719175/job/111268303582) сообщает `publishable=true` для точного SHA, но не покрывает этот путь. Поэтому оба слоя дали BLOCKED, исключение не принималось, отдельная задача #1067 открыта. Временная core-фикстура не запускала host-global launchd, реальный LLM, живые WSL/systemd и полную установку Windows; optional extractor backfill предупредил об отсутствующем каталоге LaunchAgents внутри фикстурного HOME. Проверяющий слоя 6 ранее рецензировал PR выпуска, но не писал его код.
+- Для v0.41.1 проверен опубликованный тег faccdf3c7fa1429145de4d9bd43c65ed78788b95: калибровка защитной обёртки, 11/11 интеграционных проверок, 53/53 проверок чистой установки и 3/3 фикстуры детектора; все 791 хешей манифеста совпали. Одноразовая установка v0.41.0 успешно обновилась через реальный release-канал: 75 изменений, 1 удаление, три пользовательских маркера сохранились; второй запуск сообщил, что обновлений нет. [Точная CI-квитанция](https://github.com/TserenTserenov/FMT-exocortex-template/actions/runs/37139099577) считает дерево выпускаемым, но не покрывает обнаруженные случаи: #1060 получил красный контроль (при логе ошибки v0.41.0 показывает белый статус, v0.41.1 — зелёный), #1061 — красный контроль обязательного файла в установке только из манифеста. Исправленного зелёного кандидата и принятой владельцем оговорки для них пока нет, поэтому итог BLOCKED; закрытие #1059 отложено. На итоговом push macOS job был штатно пропущен, но два macOS job прошли на [PR-дереве, совпадающем с тегом](https://github.com/TserenTserenov/FMT-exocortex-template/actions/runs/37137661479). Windows/Git Bash проверен только точечными CI jobs, WSL2 и живой Linux systemd не проверялись; отдельная подписанная аттестация этим аудитом не предоставлена.
+- Для F1 из раннего прогона v0.40.0 #779 добавил
+  `setup/detector-fixtures/detector_07/positive_quoted_literal.md`: прежний
+  регекс не ловит образец, текущий `setup/test-detectors.sh` проходит 3 из 3
+  фикстур. F2 — удаление ссылок без отдельной исполняемой проверки; F3 —
+  исправление текущих описаний в #1024, старый текст напоминания #748 остаётся
+  историческим. F4 требует пофайлового обоснования `substituted` или контроля:
+  сам контракт допускает файл без `{{}}`, если он должен жить в workspace.
+  F5 — ложное обещание warn gate удалено в #1024, самого gate нет. Решение
+  убрать `/lesson-close` принято и доставлено #845; отдельной красной и зелёной
+  проверки для этой находки не записано.
+- Для v0.41.0 #999 воспроизвёл код 49 на старом `update.sh`, затем провёл
+  `scripts/tests/test_issue_541_workspace_base.sh` (142 проверки и 7 красных
+  мутантов). #1000 проверил `strategy-session` тестом
+  `scripts/tests/test_issue_969_strategy_session_isolated_copy.sh`
+  (3 красных мутанта, зелёный кандидат); полный тест старого выпуска этим не
+  доказан. #1001 проверил YAML и код, но не живую доставку ботом и
+  дедупликацию. #1002–#1006 остаются открытыми, а не принятой оговоркой.
+- Четыре важные находки внешнего прогона v0.41.0 получили отдельные задачи:
+  миграционный путь #1036, `core.fileMode=false` #1037, Python-литералы #1038,
+  Linux systemd #1039. Миграция #1036 исправлена в main через #1041 с проверкой
+  старой установки; Python-пути #1038 исправлены в main через #1040 и закрыты:
+  это авторские скрипты вне пользовательского манифеста. #1037 исправлена в main
+  через #1042 после красной репродукции и сквозной проверки; #1039 остаётся открытой.
+  Исправления из main ещё не доставлены новым выпуском. Ни один из пунктов не получил
+  здесь принятой оговорки или завершённой проверки установленного выпуска.
+- Для #559 дефект v0.39.0 подтверждён чтением кода в #576; v0.39.1 прошёл
+  ручную пробу после #575. Регрессионный тест `RC_STEP_SKIPPED` и счётчика
+  ссылок на уроки добавлен в main через #1035; независимый повтор выпуска
+  не записан.
 
 ## Скрытое наблюдение из мигрированных issues
 
-При spot-check мигрируемых issue (peer-session 2026-06-01-18, авторский governance-репо, session-транскрипт не публикуется) обнаружено: M-checklist #75 (M1.6) содержит подтверждение что **adversarial audit 2026-05-06 нашёл 40 findings и все они зафиксированы** (status: ✅ Fixed по C1-C4, H2, ...). То есть один из мигрированных аудитов был реально проведён — это не «skipped-unverified», это **completed без записи в публичный log**. Запись восстановлена в строке `v0.29.x (round-2)`.
+При spot-check мигрированных задач подтверждён сам состязательный аудит 2026-05-06
+с заявленными 40 находками (#75), поэтому его статус здесь `completed`.
+Однако #75 не доказывает исправление всех 40: он перечисляет шесть `Fixed`
+и три `To verify`. Полный реестр находок и их исполняемые квитанции не
+доставлены в текущем дереве; прошлое утверждение «все исправлены» отозвано.
 
 ## Дальнейшее использование
 
-- Каждый новый релиз → строка в этой таблице (вместо auto-issue).
-- `verify-before-promote.sh` warn-gate: при попытке промоушна без записи о предыдущем релизе — warning (не блок).
+- Каждый проверенный релиз → строка в этой таблице. Issue от workflow служит
+  напоминанием и не заменяет запись результата или отдельные открытые задачи
+  для нерешённых существенных находок.
+- Автоматического предупреждения при выпуске без записи в этой таблице сейчас
+  нет: `verify-before-promote.sh` отсутствует в дереве шаблона.
 - Раз в квартал — review log: `skipped-unverified` старше 90 дней → принять решение (run-now / accept-debt / wontfix).
 
 ## Связанные
 
-- `verify-before-promote.sh` — gate для record-keeping
-- `integration-detectors.sh` — куда возвращаются находки audit'а
-- `TESTING.md` — общая стратегия
+- `.github/workflows/post-release-audit.yml` — создание issue-напоминания
+- `setup/integration-contract-validator.sh` и `setup/test-detectors.sh` —
+  текущие детекторы и их фикстуры
 - Peer-session 2026-06-01-18 (авторский governance-репо) — миграция из 22 open issues

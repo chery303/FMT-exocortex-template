@@ -86,6 +86,36 @@ DATE=$(date +%Y-%m-%d)
 HOUR=$(date +%H)
 LOG_FILE="$LOG_DIR/$DATE.log"
 
+# Issue #1006: macOS (no coreutils) and launchd have no timeout(1); a bare `timeout 20 git fetch`
+# was "command not found" and the fetch was silently skipped. Same perl polyfill as
+# scripts/active-wp-sweep.sh and strategist.sh.
+if ! command -v timeout >/dev/null 2>&1; then
+    timeout() {
+        local duration="$1"; shift
+        perl -e '
+            my $timeout = shift @ARGV;
+            my $timed_out = 0;
+            my $pid = fork();
+            if ($pid == 0) { exec @ARGV; die "exec failed: $!"; }
+            eval {
+                local $SIG{ALRM} = sub { $timed_out = 1; die "timeout\n"; };
+                alarm $timeout;
+                waitpid($pid, 0);
+                alarm 0;
+            };
+            if ($timed_out) {
+                kill "TERM", $pid;
+                select(undef, undef, undef, 0.5);
+                kill "KILL", $pid;
+                waitpid($pid, 0);
+                exit 124;
+            }
+            # A child ended by a signal reports 128+signal, like the shell does.
+            exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8));
+        ' "$duration" "$@"
+    }
+fi
+
 log() {
     # `|| true`: a transient failure writing $LOG_FILE (seen live: macOS
     # "Operation not permitted" on a handful of runs, cause unconfirmed) must
@@ -188,7 +218,7 @@ load_claude_subscription_token() {
 # A subscription token must reach the vendor API directly. ENV_FILE may carry a
 # proxy (ANTHROPIC_BASE_URL) and load_env sources it AFTER any wrapper already
 # dropped it, so the client sent the token to the proxy: 401 "Invalid or expired
-# token" (tsekh-1, 2026-09-21). That proxy also drops the `tools` array, so it
+# token" (a pilot's remote host, 2026-09-21). That proxy also drops the `tools` array, so it
 # cannot serve headless tool-use at all. Auth policy: a connected subscription
 # wins over proxy/API-key env; IWE_EXTRACTOR_USE_API_ENV=1 opts out for a
 # deliberate custom gateway and then withholds the subscription token from it.

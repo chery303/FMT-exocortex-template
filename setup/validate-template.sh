@@ -2,12 +2,12 @@
 # Validate Template — проверка целостности FMT-exocortex-template
 #
 # Режимы (--mode=...):
-#   pristine  (default) — все 7 проверок. Для CI, author template-sync, fresh clone до setup.sh.
+#   pristine  (default) — все 9 проверок. Для CI, author template-sync, fresh clone до setup.sh.
 #   installed           — пропускает чеки 2/3/4, которые легитимно нарушаются после setup.sh
 #                         (/Users/ подставлен, /opt/homebrew в CLAUDE_PATH, MEMORY заполняется работой).
 #                         Используется setup.sh --validate как делегат структурных чеков.
 #
-# 8 проверок:
+# 9 проверок:
 # 1. Нет автор-специфичного контента                              [pristine + installed]
 # 2. Нет захардкоженных путей /Users/                             [pristine only]
 # 3. Нет захардкоженных путей /opt/homebrew                       [pristine only]
@@ -16,6 +16,7 @@
 # 6. Нет хардкод-путей к FMT/scripts|roles в протоколах (WP-219)  [pristine + installed]
 # 7. settings.json hooks ↔ .claude/hooks/ cross-ref (issue #13)   [pristine + installed]
 # 8. Нет устаревших семантических ссылок FPF                     [pristine + staged]
+# 9. SKILL.md claims of an active hook match settings.json (#1109) [pristine + installed]
 
 set -euo pipefail
 
@@ -100,13 +101,88 @@ is_excluded_path() {
     done <<< "$EXCLUDED_LIST"
     return 1
 }
+is_author_context_exception() {
+    # Existing workflow-only context: one host access control and three
+    # historical/test comments; one vendored-copy line that can't be edited
+    # in place (guide-kit/, byte-identical sync — see
+    # scripts/guide-kit-sync-state.yaml; fix belongs upstream, issue #1107);
+    # five lines using "DS-Knowledge-Index" as the generic, flat convention
+    # name for this optional per-pilot repo (same pattern as DS-strategy and
+    # DS-personal-guide — every pilot creates their OWN repo with this same
+    # name, it is not one specific author's instance; issue #1107 triage);
+    # one functional check for "DS-ecosystem-development/" — docs/LEARNING-PATH.md
+    # (exempt from this scan) documents it the same way: an optional, locally-
+    # created ecosystem governance repo any pilot may set up, parallel to
+    # DS-strategy, not one author's personal instance; six references to
+    # session-dispatcher-tsekh.py (one manifest entry, three byte-identical
+    # find-python3.sh comments, two tool comments) for the same reason: the
+    # script itself is deliberately excluded from delivery (EXCLUDED_SCRIPTS)
+    # because it is author-host-specific, so renaming it would require
+    # coordinating the author's own external systemd/cron setup for zero
+    # end-user benefit (issue #1107 triage); three stable incident-ID slugs
+    # (bug-2026-09-17-tsekh1-*) that the author cross-references outside this
+    # repo — the ID's date+host encoding is disambiguating information, not
+    # personal leakage, and no local bugs/ directory exists here to confirm a
+    # rename is even safe (issue #1107 triage).
+    # Match the whole line, never the whole file.
+    local line="$2"
+    line="${line%$'\r'}"  # grep preserves a final CR in Windows line endings.
+    case "$1:$line" in
+        '.github/workflows/changelog-gate.yml:      NO_CHANGELOG_ALLOWED: "TserenTserenov"'|\
+        '.github/workflows/translate-sync.yml:# TserenTserenov; it was never one of the aisystant repos slated for a'|\
+        '.github/workflows/release-watchdog.yml:# создана: DS-IT-systems для агента read-only.'|\
+        '.github/workflows/validate-template.yml:      # Имитируем pristine user: DS-strategy вместо DS-my-strategy, DayPlan с минимальным шаблоном.'|\
+        'guide-kit/generator/personal_export.py:    pathlib.Path.home() / "IWE/DS-my-strategy/inbox/WP-425/cache/derived_snapshot.json"'|\
+        'memory/protocol-work.md:| Заготовка | `DS-Knowledge-Index` status: draft | 14 дней | пост (published) / archive |'|\
+        'memory/protocol-work.md:> **Черновик ≠ Заготовка.** Черновик — личный (DS-strategy). Заготовка — публичная (DS-Knowledge-Index).'|\
+        'roles/strategist/prompts/week-review.md:Для этого запуска скрипт-обёртка уже открыла служебную сессию охраны (`week-review`, область `current/`) и закроет её сама. Свою сессию (`session-guard.sh open`) не открывай: на замороженном каталоге она отказана, а придуманное значение `--wp` охрана отвергает. В репозитории governance изменяй и коммить только файлы в `current/`; пост клуба (шаг 6) относится к репозиторию Knowledge Index (`DS-Knowledge-Index`), не к governance, и этой сессией не покрывается. Отказ охраны не обходи (`--force`, `--no-verify`, правка хуков): выведи дословный текст отказа в итоговый ответ. Скрипт-обёртка проверяет, что отчёт недели попал на сервер, и поднимет тревогу владельцу, если нет.'|\
+        'roles/synchronizer/scripts/collectors.d/README.md:- `publications.sh` — публикации (если есть DS-Knowledge-Index-*/docs/)'|\
+        'scripts/week-draft-init.sh:  echo "   knowledge_repo: \"DS-Knowledge-Index\""'|\
+        '.claude/hooks/rule-engine.sh:        if ! echo "$file_path" | grep -qE '"'"'DS-[^/]+-strategy/|DS-ecosystem-development/'"'"'; then'|\
+        'update-manifest.json:    "scripts/session-dispatcher-tsekh.py",'|\
+        'setup.sh:    echo "  ⚠ Не найден python3 >= 3.10 с библиотекой PyYAML — календарь, лента «Мир», обзор РП и core-скрипты (artifactor.py, session-dispatcher-tsekh.py) будут отключаться с явной ошибкой зависимости."'|\
+        'generate-manifest.sh:    "scripts/session-dispatcher-tsekh.py"       # нет ссылок из доставляемого'|\
+        'seed/strategy/scripts/lib/find-python3.sh:# core scripts (artifactor.py, session-dispatcher-tsekh.py). Reject 3.9 early'|\
+        '.claude/lib/find-python3.sh:# core scripts (artifactor.py, session-dispatcher-tsekh.py). Reject 3.9 early'|\
+        'scripts/lib/find-python3.sh:# core scripts (artifactor.py, session-dispatcher-tsekh.py). Reject 3.9 early'|\
+        'setup/build-runtime.sh:# bug-2026-09-17-tsekh1-recovery-backups-abort: under `set -eu`, a single'|\
+        'setup/build-runtime.sh:# bug-2026-09-17-tsekh1-recovery-backups-abort (продолжение): leftovers from'|\
+        'update.sh:# author_release_regression FPATH PAYLOAD — bug-2026-09-17-tsekh1-release-') return 0 ;;
+    esac
+    return 1
+}
+filter_staged_author_hits() {
+    local rel="$1" entry key seen=$'\n'
+    while IFS= read -r entry; do
+        if is_author_context_exception "$rel" "${entry#*:}"; then
+            key="$rel:${entry#*:}"
+            key="${key%$'\r'}"
+            case "$seen" in
+                *$'\n'"$key"$'\n'*) ;;
+                *) seen="${seen}${key}"$'\n'; continue ;;
+            esac
+        fi
+        printf '%s\n' "$entry"
+    done
+}
 filter_excluded_hits() {
-    # stdin: grep -r output "<abs-path>:<line>:<text>" — drop excluded_paths rows
-    local line abs rel
+    # stdin: grep -r output "<abs-path>:<line>:<text>" — drop excluded_paths
+    # and exact workflow-context exceptions, retaining every other .yml hit.
+    local line abs rel numbered key seen=$'\n'
     while IFS= read -r line; do
         abs="${line%%:*}"
         rel="${abs#"$TEMPLATE_DIR"/}"
-        is_excluded_path "$rel" || printf '%s\n' "$line"
+        is_excluded_path "$rel" && continue
+        numbered="${line#"$abs":}"
+        if is_author_context_exception "$rel" "${numbered#*:}"; then
+            key="$rel:${numbered#*:}"
+            key="${key%$'\r'}"
+            case "$seen" in
+                *$'\n'"$key"$'\n'*) ;;
+                *) seen="${seen}${key}"$'\n'; continue ;;
+            esac
+        fi
+        printf '%s\n' "$line"
     done
 }
 
@@ -119,19 +195,17 @@ CHECK1_FAIL=0
 # коде как "TserenTserenov" (mixed-case) — case-sensitive grep никогда не ловил
 # его, поймано только парным паттерном "DS-my-strategy" на тех же строках (2026-07-27).
 for pattern in "tserentserenov" "PACK-MIM" "aist_bot_newarchitecture" \
-               "DS-Knowledge-Index-Tseren" "DS-IT-systems" "DS-ai-systems" \
-               "DS-my-strategy" "engines/tailor"; do
+               "DS-Knowledge-Index" "DS-IT-systems" "DS-ai-systems" \
+               "DS-my-strategy" "engines/tailor" "tsekh" "DS-ecosystem-development" \
+               "tseren"; do
     if [ "$MODE" = "staged" ]; then
         # staged-режим: проверяем только содержимое staged-файлов (git show :path)
         count=0
         hits=""
         while IFS= read -r f; do
-            case "$f" in
-                guide-kit/*) continue ;;  # vendored copy is derived-only (WP-483) — checked by its upstream CI
-            esac
             is_excluded_path "$f" && continue  # frozen out of delivery (#547)
             case "$f" in
-                *.md|*.sh|*.py|*.json|*.plist|*.yaml) ;;
+                *.md|*.sh|*.py|*.json|*.plist|*.yaml|*.yml) ;;
                 *) continue ;;
             esac
             case "$(basename "$f")" in
@@ -145,7 +219,8 @@ for pattern in "tserentserenov" "PACK-MIM" "aist_bot_newarchitecture" \
             file_hits=$(cd "$TEMPLATE_DIR" && git show ":$f" 2>/dev/null \
                 | grep -in "$pattern" | grep -v 'github.com/' | grep -v 'docs/adr/' \
                 | grep -v 'githubusercontent\.com' \
-                | grep -viE 'TserenTserenov/(FMT-exocortex-template|ZP|SPF)' || true)
+                | grep -viE 'TserenTserenov/(FMT-exocortex-template|ZP|SPF)' \
+                | filter_staged_author_hits "$f" || true)
             if [ -n "$file_hits" ]; then
                 count=$((count + $(echo "$file_hits" | wc -l | tr -d ' ')))
                 hits="${hits}${f}:"$'\n'"${file_hits}"$'\n'
@@ -153,10 +228,10 @@ for pattern in "tserentserenov" "PACK-MIM" "aist_bot_newarchitecture" \
         done <<< "$STAGED_FILES"
     else
         count=$(grep -rin "$pattern" "$TEMPLATE_DIR" --include="*.md" --include="*.sh" \
-                --include="*.py" --include="*.json" --include="*.plist" --include="*.yaml" \
+                --include="*.py" --include="*.json" --include="*.plist" --include="*.yaml" --include="*.yml" \
                 --exclude='validate-template.sh' --exclude='LEARNING-PATH.md' \
                 --exclude='CHANGELOG.md' --exclude='aisystant-sync-targets.yaml' \
-                --exclude='translation-manifest.yaml' --exclude-dir='guide-kit' 2>/dev/null \
+                --exclude='translation-manifest.yaml' 2>/dev/null \
                 | grep -v 'github.com/' | grep -v 'docs/adr/' | grep -v 'githubusercontent\.com' \
                 | grep -viE 'TserenTserenov/(FMT-exocortex-template|ZP|SPF)' \
                 | filter_excluded_hits | wc -l | tr -d ' ' || true)
@@ -168,10 +243,10 @@ for pattern in "tserentserenov" "PACK-MIM" "aist_bot_newarchitecture" \
             echo "$hits" | head -3 || true
         else
             grep -rin "$pattern" "$TEMPLATE_DIR" --include="*.md" --include="*.sh" \
-                --include="*.py" --include="*.json" --include="*.plist" \
+                --include="*.py" --include="*.json" --include="*.plist" --include="*.yaml" --include="*.yml" \
                 --exclude='validate-template.sh' --exclude='LEARNING-PATH.md' \
                 --exclude='CHANGELOG.md' --exclude='aisystant-sync-targets.yaml' \
-                --exclude='translation-manifest.yaml' --exclude-dir='guide-kit' 2>/dev/null \
+                --exclude='translation-manifest.yaml' 2>/dev/null \
                 | grep -v 'github.com/' | grep -v 'docs/adr/' | grep -v 'githubusercontent\.com' \
                 | grep -viE 'TserenTserenov/(FMT-exocortex-template|ZP|SPF)' \
                 | filter_excluded_hits | head -3 || true
@@ -223,7 +298,7 @@ if [ "$MODE" = "staged" ] && [ "$(cd "$TEMPLATE_DIR" && git status --porcelain 2
     UNSTAGED_WARN=0
     for pattern in "tserentserenov" "PACK-MIM" "aist_bot_newarchitecture" "DS-IT-systems"; do
         warn_count=$(grep -rin "$pattern" "$TEMPLATE_DIR" --include="*.md" --include="*.sh" \
-                     --include="*.py" --include="*.yaml" \
+                     --include="*.py" --include="*.yaml" --include="*.yml" \
                      --exclude='validate-template.sh' --exclude='CHANGELOG.md' 2>/dev/null \
                      | grep -v 'github.com/' | wc -l | tr -d ' ' || true)
         if [ "$warn_count" -gt 0 ]; then
@@ -532,6 +607,84 @@ else
     else
         echo "PASS"
     fi
+fi
+
+# 9. SKILL.md hook-claims must be registered (issue #1109).
+#
+# Check [7/7] above only WARNs when a hook file in .claude/hooks/ is not
+# referenced from settings.json — a legitimate state for a script that is
+# invoked directly rather than through Claude Code's PreToolUse dispatch
+# (e.g. a library sourced by other hooks). But when a SKILL.md explicitly
+# documents a hook as ACTIVE protection ("Hook `x.sh` блокирует ..." / "hook
+# ... blocks ..."), an unregistered hook is not a benign unused file — it is
+# a fail-open security claim: the hook's own isolated unit test can pass
+# forever while no real session ever invokes it (same false-confidence class
+# as issues #310/#323, found by independent audit on pack-creator-spf-guard.sh).
+# This check escalates exactly that case from WARN to FAIL.
+#
+# Detection is mechanical, not NLP, to keep it reliable across the whole
+# .claude/skills/ tree (general version, not hardcoded to one hook): a
+# SKILL.md line counts as an "active protection" claim only when THREE
+# things co-occur on the SAME line —
+#   (a) the basename of a real file under .claude/hooks/*.sh,
+#   (b) the word "hook" or "хук" (case-insensitive),
+#   (c) an enforcement verb — blocks/guards/prevents/denies/stops/enforces
+#       (EN) or блокир/защища/запрещ/отказ (RU), either case.
+# Verified against this repo before the settings.json fix in this same
+# commit: the triple co-occurs on exactly 3 lines across every SKILL.md —
+# destructive-guard.sh and dry-run-gate.sh (both already registered → PASS)
+# and pack-creator-spf-guard.sh (not registered → exactly the bug this
+# check exists to catch).
+echo -n "[9/9] SKILL.md hook-claims are registered... "
+if [ ${#SETTINGS_FILES[@]} -eq 0 ] || [ ! -d "$HOOKS_DIR" ]; then
+    echo "SKIP (no settings.json or hooks/ dir)"
+else
+    CHECK9_FAIL=0
+    ENFORCE_RE='block|Block|блокир|Блокир|guard|Guard|защища|Защища|запрещ|Запрещ|prevent|Prevent|enforc|Enforc|deni|Deni|отказ|Отказ|stop|Stop'
+    for hook_path in "$HOOKS_DIR"/*.sh; do
+        [ -f "$hook_path" ] || continue
+        hookname=$(basename "$hook_path")
+        # Already wired under PreToolUse specifically — the only event type
+        # that can actually block a Write/Edit/MultiEdit/NotebookEdit before
+        # it runs. A plain string-presence grep (the check this replaced)
+        # can't tell PreToolUse apart from SessionStart/PostToolUse/Stop etc,
+        # so a hook registered under the wrong event type still read as
+        # "registered" and this check never escalated it (found by
+        # adversarial review, 2026-10-06: moved a hook's own registration to
+        # SessionStart while leaving its path string elsewhere in the same
+        # file — check [9/9] kept reporting PASS).
+        registered_pretooluse=0
+        for settings_file in "${SETTINGS_FILES[@]}"; do
+            if python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except (OSError, ValueError):
+    sys.exit(1)
+for entry in data.get('hooks', {}).get('PreToolUse', []):
+    for h in entry.get('hooks', []):
+        if sys.argv[2] in h.get('command', ''):
+            sys.exit(0)
+sys.exit(1)
+" "$settings_file" "$hookname" 2>/dev/null; then
+                registered_pretooluse=1
+                break
+            fi
+        done
+        [ "$registered_pretooluse" -eq 1 ] && continue
+        esc_name=$(printf '%s' "$hookname" | sed 's/\./\\./g')
+        hits=$(grep -rnEi "$esc_name" "$TEMPLATE_DIR/.claude/skills" --include=SKILL.md 2>/dev/null \
+            | grep -Ei 'hook|хук' | grep -E "$ENFORCE_RE" || true)
+        if [ -n "$hits" ]; then
+            [ "$CHECK9_FAIL" -eq 0 ] && echo "FAIL"
+            echo "  $hookname: SKILL.md заявляет активную защиту (хук + блокирующий глагол в одной строке), но хук не зарегистрирован под PreToolUse ни в одном settings.json:"
+            echo "$hits" | sed 's/^/    /' | head -5
+            CHECK9_FAIL=1
+            FAIL=1
+        fi
+    done
+    [ "$CHECK9_FAIL" -eq 0 ] && echo "PASS"
 fi
 
 echo ""

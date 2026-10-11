@@ -9,7 +9,7 @@
 #
 # Env overrides:
 #   CODEX_BIN     — override codex binary path
-#   IWE_TEMPLATE  — path to FMT-exocortex-template (default: $HOME/IWE/FMT-exocortex-template)
+#   IWE_TEMPLATE  — path to FMT-exocortex-template for optional Hindsight retain
 #   IWE_PEER_LOCK_DIR, IWE_HINDSIGHT_RETAIN — same as kimi-peer-adapter.sh
 #   CODEX_PEER_REASONING_EFFORT — model_reasoning_effort passed to `codex exec`
 #     via -c (default: medium). Overrides whatever ~/.codex/config.toml sets
@@ -34,6 +34,7 @@ set -uo pipefail
 
 IWE_TEMPLATE="${IWE_TEMPLATE:-$HOME/IWE/FMT-exocortex-template}"
 TEMPLATE_SCRIPTS="$IWE_TEMPLATE/scripts"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # === Codex binary auto-detect: env override → PATH → VS Code extension (bundled, versioned dir) ===
 CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
@@ -56,6 +57,15 @@ if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
   echo "  Looked in: PATH, ~/.vscode/extensions/openai.chatgpt-*/bin/*/codex (and .vscode-server/.cursor variants)" >&2
   exit 1
 fi
+
+# The three safety filters travel with the adapter. Refuse the peer call if a
+# local copy is absent; an absent map must never silently disable filtering.
+for FILTER_FILE in peer-adapter-filter.py content-filter-apply.py content-filter-map.txt; do
+  if [ ! -s "$SCRIPT_DIR/$FILTER_FILE" ]; then
+    echo "ABORT: required local peer filter missing or empty: $SCRIPT_DIR/$FILTER_FILE" >&2
+    exit 2
+  fi
+done
 
 # Auto-source OpenRouter key (hosts without a ChatGPT login route codex
 # through OpenRouter, see reference_codex_peer_openrouter_linux.md).
@@ -102,7 +112,7 @@ if [ ${#MODEL_ARG[@]} -ge 2 ]; then
   esac
 fi
 
-# === Фильтрация --add-dir через .agentigore + PII sanity-check (шаблонные скрипты, read-only reuse) ===
+# === Фильтрация --add-dir через .agentigore + PII sanity-check (соседние копии) ===
 
 FILTERED_DIRS=()
 # `-t template` is BSD/GNU compatible in practice but its exact semantics
@@ -132,14 +142,14 @@ for ADD_DIR in "${ADD_DIRS[@]+"${ADD_DIRS[@]}"}"; do
   fi
 done
 
-# === Фильтрация через Python fnmatch + PII sanity-check (шаблонный peer-adapter-filter.py) ===
+# === Фильтрация через Python fnmatch + PII sanity-check (локальный peer-adapter-filter.py) ===
 for ADD_DIR in "${ADD_DIRS[@]+"${ADD_DIRS[@]}"}"; do
   [ ! -d "$ADD_DIR" ] && continue
   CLEAN_DIR="$TMP_ROOT/$(basename "$ADD_DIR")"
   mkdir -p "$CLEAN_DIR"
 
   AGENTIGORE_FILE="$MERGED_AGENTIGORE" SRC_DIR="$ADD_DIR" DST_DIR="$CLEAN_DIR" \
-    python3 "$TEMPLATE_SCRIPTS/peer-adapter-filter.py"
+    python3 "$SCRIPT_DIR/peer-adapter-filter.py"
   RC=$?
   if [ $RC -eq 3 ]; then
     exit 3
@@ -151,17 +161,18 @@ for ADD_DIR in "${ADD_DIRS[@]+"${ADD_DIRS[@]}"}"; do
   FILTERED_DIRS+=("--add-dir" "$CLEAN_DIR")
 done
 
-# === Content-filter guard (переиспользуем шаблонную content-filter-map.txt) ===
+# === Content-filter guard (локальная копия content-filter-map.txt) ===
 PROMPT_FILE="$TMP_ROOT/peer-prompt.in"
 cat > "$PROMPT_FILE"
 
-CONTENT_FILTER_MAP="$TEMPLATE_SCRIPTS/content-filter-map.txt"
-if [ -f "$CONTENT_FILTER_MAP" ] && [ -s "$CONTENT_FILTER_MAP" ]; then
-  if python3 "$TEMPLATE_SCRIPTS/content-filter-apply.py" "$CONTENT_FILTER_MAP" \
-       < "$PROMPT_FILE" > "$PROMPT_FILE.filtered" 2>/dev/null \
-     && [ -s "$PROMPT_FILE.filtered" ]; then
-    PROMPT_FILE="$PROMPT_FILE.filtered"
-  fi
+CONTENT_FILTER_MAP="$SCRIPT_DIR/content-filter-map.txt"
+if python3 "$SCRIPT_DIR/content-filter-apply.py" "$CONTENT_FILTER_MAP" \
+     --strict-map < "$PROMPT_FILE" > "$PROMPT_FILE.filtered" 2>/dev/null \
+   && [ -s "$PROMPT_FILE.filtered" ]; then
+  PROMPT_FILE="$PROMPT_FILE.filtered"
+else
+  echo "ABORT: local peer content filter failed or returned an empty prompt" >&2
+  exit 2
 fi
 
 # === Sanitize surrogate characters before Codex call ===

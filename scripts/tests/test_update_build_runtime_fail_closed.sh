@@ -60,6 +60,9 @@ cp "$SCRIPT_DIR/CLAUDE.md" "$SCRIPT_DIR/.claude.md.base"
 WORKSPACE_DIR="$TEST_ROOT/repo"
 cp "$SCRIPT_DIR/CLAUDE.md" "$WORKSPACE_DIR/CLAUDE.md"
 cp "$SCRIPT_DIR/CLAUDE.md" "$WORKSPACE_DIR/.claude.md.base"
+printf 'GITHUB_USER="test-user"\nWORKSPACE_DIR="%s"\n' "$WORKSPACE_DIR" \
+    > "$WORKSPACE_DIR/.exocortex.env"
+chmod 600 "$WORKSPACE_DIR/.exocortex.env"
 
 # Failing build-runtime stub; the probe log also proves it was invoked at all.
 cat > "$SCRIPT_DIR/setup/build-runtime.sh" <<'EOF'
@@ -92,7 +95,11 @@ for ((i=0; i<\${#args[@]}; i++)); do
 done
 rel="\${url#*/main/}"
 if [ "\$rel" = "update.sh" ]; then
-    cp "$SCRIPT_DIR/update.sh" "\$out"
+    if [ -f "$UPSTREAM/update.sh" ]; then
+        cp "$UPSTREAM/update.sh" "\$out"
+    else
+        cp "$SCRIPT_DIR/update.sh" "\$out"
+    fi
 elif [ "\$rel" = "update-manifest.json" ]; then
     cp "$UPSTREAM/update-manifest.json" "\$out"
 else
@@ -224,14 +231,43 @@ mkdir -p \
     "$SCRIPT_DIR/seed/strategy/.githooks" \
     "$SCRIPT_DIR/scripts/agent-fault" \
     "$SCRIPT_DIR/scripts" \
+    "$SCRIPT_DIR/.claude/scripts" \
     "$WORKSPACE_DIR/.claude/skills/smoke-catalog" \
     "$WORKSPACE_DIR/custom-governance/scripts"
+cp "$ROOT/.claude/scripts/classify-workspace-copy.sh" \
+    "$SCRIPT_DIR/.claude/scripts/classify-workspace-copy.sh"
+chmod +x "$SCRIPT_DIR/.claude/scripts/classify-workspace-copy.sh"
 cp "$ROOT/seed/strategy/scripts/install-hooks.sh" \
     "$SCRIPT_DIR/seed/strategy/scripts/install-hooks.sh"
 cp "$ROOT/seed/strategy/.githooks/pre-commit" \
     "$SCRIPT_DIR/seed/strategy/.githooks/pre-commit"
 cp "$ROOT/seed/strategy/.githooks/pre-push" \
     "$SCRIPT_DIR/seed/strategy/.githooks/pre-push"
+cat > "$SCRIPT_DIR/seed/strategy/scripts/update-derived-snapshot.py" <<'OLDSNAP'
+#!/usr/bin/env python3
+# Synthetic pre-WP-485 release fixture for update.sh governance-script
+# content-policy tests -- not real production code. Exists only so
+# $SCRIPT_DIR's own git history has a real prior commit at this path,
+# letting classify-workspace-copy.sh recognize the governance fixture's
+# matching bytes below as "a known old release" instead of "unknown
+# no-history".
+import pathlib
+
+IWE_ROOT = pathlib.Path.home() / "IWE"
+GOVERNANCE = IWE_ROOT / "DS-strategy"
+SNAPSHOT_PATH = GOVERNANCE / "inbox/WP-425/cache/derived_snapshot.json"
+
+
+def main() -> int:
+    print("old snapshot fixture")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+OLDSNAP
+git -C "$SCRIPT_DIR" add -- seed/strategy/scripts/update-derived-snapshot.py
+git -C "$SCRIPT_DIR" commit -q -m "fixture: old update-derived-snapshot.py release"
 cp "$ROOT/seed/strategy/scripts/update-derived-snapshot.py" \
     "$SCRIPT_DIR/seed/strategy/scripts/update-derived-snapshot.py"
 cp "$ROOT/seed/strategy/scripts/day-open-llm-fill.py" \
@@ -282,8 +318,37 @@ printf 'GOVERNANCE_REPO=custom-governance\n' > "$WORKSPACE_DIR/.exocortex.env"
 
 GOVERNANCE="$WORKSPACE_DIR/custom-governance"
 printf '#!/bin/bash\necho old installer\n' > "$GOVERNANCE/scripts/install-hooks.sh"
-printf '#!/usr/bin/env python3\nprint("old snapshot")\n' \
-    > "$GOVERNANCE/scripts/update-derived-snapshot.py"
+# WP-485 F17: this governance fixture must be byte-identical to the OLD
+# commit just made in $SCRIPT_DIR above -- classify-workspace-copy.sh
+# recognizes a governance copy as "a known old release" only by matching
+# its bytes against a commit that actually exists in $SCRIPT_DIR's own
+# git history, never against the outer repo's real history (which this
+# fixture does not carry). A synthetic one-liner with no matching commit
+# is "unknown, keep it" under the new content-based policy -- defeating
+# this fixture's own intent to test the upgrade path.
+cat > "$GOVERNANCE/scripts/update-derived-snapshot.py" <<'OLDSNAP'
+#!/usr/bin/env python3
+# Synthetic pre-WP-485 release fixture for update.sh governance-script
+# content-policy tests -- not real production code. Exists only so
+# $SCRIPT_DIR's own git history has a real prior commit at this path,
+# letting classify-workspace-copy.sh recognize the governance fixture's
+# matching bytes below as "a known old release" instead of "unknown
+# no-history".
+import pathlib
+
+IWE_ROOT = pathlib.Path.home() / "IWE"
+GOVERNANCE = IWE_ROOT / "DS-strategy"
+SNAPSHOT_PATH = GOVERNANCE / "inbox/WP-425/cache/derived_snapshot.json"
+
+
+def main() -> int:
+    print("old snapshot fixture")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+OLDSNAP
 cp "$ROOT/seed/strategy/REPO-TYPE.md" "$GOVERNANCE/REPO-TYPE.md"
 cat > "$GOVERNANCE/scripts/day-open-pipeline.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -364,10 +429,16 @@ if [ -f "$SCRIPT_DIR/.update-incomplete" ]; then
 else
     pass "D2: marker removed only after all post-backfills succeeded"
 fi
+# WP-485 F17: day-open-llm-fill.py is confirmed platform-owned (executed
+# only from $IWE_SCRIPTS, the template copy -- never the governance-repo
+# copy backfill wrote here) and was intentionally dropped from this
+# backfill entirely, so update.sh no longer creates or touches a
+# governance-side copy at all. Asserting it still appears here would be
+# testing the exact behaviour this fix deliberately removed, not a
+# regression -- confirmed by reading how this scenario's own governance
+# fixture never creates the file in the first place.
 if cmp -s "$SCRIPT_DIR/seed/strategy/scripts/update-derived-snapshot.py" \
       "$GOVERNANCE/scripts/update-derived-snapshot.py" && \
-   cmp -s "$SCRIPT_DIR/seed/strategy/scripts/day-open-llm-fill.py" \
-      "$GOVERNANCE/scripts/day-open-llm-fill.py" && \
    cmp -s "$SCRIPT_DIR/seed/strategy/scripts/iwe_checklist_memory.py" \
       "$GOVERNANCE/scripts/iwe_checklist_memory.py" && \
    cmp -s "$SCRIPT_DIR/seed/strategy/scripts/sync_feedback_to_memory.py" \
@@ -466,6 +537,126 @@ if [ "$EXTERNAL_CONFIG_HASH" = "$EXTERNAL_CONFIG_HASH_AFTER" ] && \
     pass "E: external git config and sentinel remain byte-identical"
 else
     fail "E: install-path step wrote through governance-root symlink before refusal"
+fi
+
+echo "--- Scenario F: missing env stops before writes and the retry converges ---"
+rm -f "$SCRIPT_DIR/.update-incomplete" "$WORKSPACE_DIR/.exocortex.env"
+rm "$WORKSPACE_DIR/linked-governance"
+mkdir -p "$WORKSPACE_DIR/personal"
+printf 'personal sentinel\n' > "$WORKSPACE_DIR/personal/keep.txt"
+printf '#!/bin/bash\necho v3\n' > "$UPSTREAM/scripts/dummy-new.sh"
+cp "$ROOT/update.sh" "$UPSTREAM/update.sh"
+# A whole but different upstream updater would self-replace at Step 0 unless
+# the missing-env guard runs first. The integrity end marker remains intact.
+sed -i.bak 's/VERSION="2.4.1"/VERSION="2.4.1-fixture"/' "$UPSTREAM/update.sh"
+rm "$UPSTREAM/update.sh.bak"
+python3 - "$UPSTREAM" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+manifest = json.loads((root / "update-manifest.json").read_text())
+manifest["version"] = "0.99.1-missing-env-test"
+for entry in manifest["files"]:
+    entry["sha256"] = hashlib.sha256((root / entry["path"]).read_bytes()).hexdigest()
+(root / "update-manifest.json").write_text(json.dumps(manifest))
+PY
+F_CLAUDE_BEFORE=$(shasum -a 256 "$WORKSPACE_DIR/CLAUDE.md" | cut -d' ' -f1)
+F_SCRIPT_BEFORE=$(shasum -a 256 "$SCRIPT_DIR/scripts/dummy-new.sh" | cut -d' ' -f1)
+F_UPDATER_BEFORE=$(shasum -a 256 "$SCRIPT_DIR/update.sh" | cut -d' ' -f1)
+
+set +e
+PATH="$SHIM_DIR:$PATH" HOME="$FAKE_HOME" IWE_UPDATE_CHANNEL=main \
+    bash "$SCRIPT_DIR/update.sh" --check > "$TEST_ROOT/out-f0.log" 2>&1
+RC_F0=$?
+set -e
+if [ "$RC_F0" -eq 0 ] && [ ! -e "$WORKSPACE_DIR/.exocortex.env" ] && \
+   [ "$F_UPDATER_BEFORE" = "$(shasum -a 256 "$SCRIPT_DIR/update.sh" | cut -d' ' -f1)" ]; then
+    pass "F0: --check stays read-only without env even when remote updater differs"
+else
+    fail "F0: --check rc=$RC_F0 created env or replaced updater"
+fi
+
+set +e
+PATH="$SHIM_DIR:$PATH" HOME="$FAKE_HOME" IWE_UPDATE_CHANNEL=main \
+    bash "$SCRIPT_DIR/update.sh" --yes > "$TEST_ROOT/out-f1.log" 2>&1
+RC_F1=$?
+set -e
+if [ "$RC_F1" -eq 3 ] && grep -q 'отсутствует .exocortex.env' "$TEST_ROOT/out-f1.log" && \
+   grep -q 'IWE_UPDATE_CHANNEL=main bash' "$TEST_ROOT/out-f1.log" && \
+   [ -f "$WORKSPACE_DIR/.exocortex.env" ] && [ ! -e "$SCRIPT_DIR/.update-incomplete" ] && \
+   [ "$(python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' \
+       "$WORKSPACE_DIR/.exocortex.env")" = '0o600' ]; then
+    pass "F1: missing env gets an actionable refusal before the update transaction"
+else
+    fail "F1: missing env rc=$RC_F1, diagnostic/env/marker contract failed"
+fi
+if [ "$F_CLAUDE_BEFORE" = "$(shasum -a 256 "$WORKSPACE_DIR/CLAUDE.md" | cut -d' ' -f1)" ] && \
+   [ "$F_SCRIPT_BEFORE" = "$(shasum -a 256 "$SCRIPT_DIR/scripts/dummy-new.sh" | cut -d' ' -f1)" ] && \
+   [ "$F_UPDATER_BEFORE" = "$(shasum -a 256 "$SCRIPT_DIR/update.sh" | cut -d' ' -f1)" ] && \
+   [ "$(cat "$WORKSPACE_DIR/personal/keep.txt")" = 'personal sentinel' ]; then
+    pass "F1: no template, CLAUDE.md or personal content was changed"
+else
+    fail "F1: missing env caused a partial write"
+fi
+
+sed -i.bak 's/GITHUB_USER="your-username"/GITHUB_USER="test-user"/' \
+    "$WORKSPACE_DIR/.exocortex.env"
+rm "$WORKSPACE_DIR/.exocortex.env.bak"
+set +e
+PATH="$SHIM_DIR:$PATH" HOME="$FAKE_HOME" IWE_UPDATE_CHANNEL=main \
+    bash "$SCRIPT_DIR/update.sh" --yes > "$TEST_ROOT/out-f2.log" 2>&1
+RC_F2=$?
+set -e
+if [ "$RC_F2" -eq 0 ] && [ ! -e "$SCRIPT_DIR/.update-incomplete" ] && \
+   [ "$(cat "$WORKSPACE_DIR/personal/keep.txt")" = 'personal sentinel' ] && \
+   cmp -s "$SCRIPT_DIR/scripts/dummy-new.sh" "$UPSTREAM/scripts/dummy-new.sh"; then
+    pass "F2: configured retry completes and preserves personal content"
+else
+    fail "F2: configured retry rc=$RC_F2 did not converge"
+fi
+
+echo "--- Scenario F3: unsafe path is refused without executable config ---"
+SPECIAL_WS="$TEST_ROOT/"'$(touch PWNED)'
+SPECIAL_TEMPLATE="$SPECIAL_WS/FMT-exocortex-template"
+mkdir -p "$SPECIAL_TEMPLATE"
+cp "$ROOT/update.sh" "$SPECIAL_TEMPLATE/update.sh"
+cp "$ROOT/CLAUDE.md" "$SPECIAL_TEMPLATE/CLAUDE.md"
+F3_UPDATER_BEFORE=$(shasum -a 256 "$SPECIAL_TEMPLATE/update.sh" | cut -d' ' -f1)
+set +e
+( cd "$TEST_ROOT" && PATH="$SHIM_DIR:$PATH" HOME="$FAKE_HOME" IWE_UPDATE_CHANNEL=main \
+    bash "$SPECIAL_TEMPLATE/update.sh" --yes ) > "$TEST_ROOT/out-f3.log" 2>&1
+RC_F3=$?
+set -e
+if [ "$RC_F3" -eq 3 ] && [ ! -e "$SPECIAL_WS/.exocortex.env" ] && \
+   [ ! -e "$TEST_ROOT/PWNED" ] && \
+   [ "$F3_UPDATER_BEFORE" = "$(shasum -a 256 "$SPECIAL_TEMPLATE/update.sh" | cut -d' ' -f1)" ] && \
+   grep -q 'опасные для автосоздания' "$TEST_ROOT/out-f3.log"; then
+    pass "F3: shell metacharacters cannot become executable env content"
+else
+    fail "F3: unsafe path rc=$RC_F3 wrote config, executed substitution or replaced updater"
+fi
+
+echo "--- Scenario F4: non-file workspace env takes precedence over legacy env ---"
+rm -f "$WORKSPACE_DIR/.exocortex.env"
+mkdir "$WORKSPACE_DIR/.exocortex.env"
+printf 'directory sentinel\n' > "$WORKSPACE_DIR/.exocortex.env/keep.txt"
+printf 'GITHUB_USER="legacy-user"\n' > "$SCRIPT_DIR/.exocortex.env"
+F4_LEGACY_BEFORE=$(shasum -a 256 "$SCRIPT_DIR/.exocortex.env" | cut -d' ' -f1)
+F4_UPDATER_BEFORE=$(shasum -a 256 "$SCRIPT_DIR/update.sh" | cut -d' ' -f1)
+set +e
+PATH="$SHIM_DIR:$PATH" HOME="$FAKE_HOME" IWE_UPDATE_CHANNEL=main \
+    bash "$SCRIPT_DIR/update.sh" --yes > "$TEST_ROOT/out-f4.log" 2>&1
+RC_F4=$?
+set -e
+if [ "$RC_F4" -eq 3 ] && [ -d "$WORKSPACE_DIR/.exocortex.env" ] && \
+   [ -x "$WORKSPACE_DIR/.exocortex.env" ] && \
+   [ "$(cat "$WORKSPACE_DIR/.exocortex.env/keep.txt")" = 'directory sentinel' ] && \
+   [ "$F4_LEGACY_BEFORE" = "$(shasum -a 256 "$SCRIPT_DIR/.exocortex.env" | cut -d' ' -f1)" ] && \
+   [ "$F4_UPDATER_BEFORE" = "$(shasum -a 256 "$SCRIPT_DIR/update.sh" | cut -d' ' -f1)" ] && \
+   [ ! -e "$SCRIPT_DIR/.update-incomplete" ]; then
+    pass "F4: directory env blocks before migration or writes"
+else
+    fail "F4: directory env rc=$RC_F4 was changed or bypassed through legacy env"
 fi
 
 echo "---"

@@ -217,6 +217,52 @@ else
 fi
 echo ""
 
+echo "=== T18: IWE_DIR self-location fallback, no env vars at all (issue #1094) ==="
+# Windows report: IWE_SCRIPTS pointed at a workspace other than $HOME/IWE, none
+# of IWE_DIR/IWE_ROOT/IWE_WORKSPACE were set, and the old code guessed
+# $HOME/IWE unconditionally. This reproduces that exact shape: a real nested
+# install (<root>/FMT-exocortex-template/scripts/route-task.sh) invoked with
+# no override vars at all, so the fix must derive <root> from the script's
+# own location instead of guessing.
+NOENV_ROOT="$HARNESS_TMP/noenv"
+# The fixture must match whatever route-task.sh itself resolves to once its
+# own subprocess below strips IWE_GOVERNANCE_REPO (env -u) -- not whatever
+# this harness's own ambient shell happens to export -- so compute it the
+# same way, in the same stripped subshell, rather than reading the ambient
+# value directly here.
+NOENV_GOV_REPO=$(env -u IWE_GOVERNANCE_REPO bash -c 'echo "${IWE_GOVERNANCE_REPO:-DS-strategy}"')
+mkdir -p "$NOENV_ROOT/FMT-exocortex-template/scripts/lib" "$NOENV_ROOT/$NOENV_GOV_REPO/scripts"
+ln -s "$SCRIPT_DIR/route-task.sh" "$NOENV_ROOT/FMT-exocortex-template/scripts/route-task.sh"
+ln -s "$SCRIPT_DIR/lib/common.sh" "$NOENV_ROOT/FMT-exocortex-template/scripts/lib/common.sh"
+ln -s "$SCRIPT_DIR/lib/find-python3.sh" "$NOENV_ROOT/FMT-exocortex-template/scripts/lib/find-python3.sh"
+cp "$FIXTURE_IWE/scripts/consent-fixture.sh" "$NOENV_ROOT/FMT-exocortex-template/scripts/"
+cat > "$NOENV_ROOT/$NOENV_GOV_REPO/scripts/executor-catalog.yaml" <<'YAML'
+schema_version: '1.0'
+generated_at: '2026-08-24T00:00:00Z'
+total_entries: 1
+entries:
+  - name: consent
+    routing:
+      executor: script
+      script_path: scripts/consent-fixture.sh
+      deterministic: true
+YAML
+set +e
+T18_OUT=$(env -u IWE_DIR -u IWE_ROOT -u IWE_WORKSPACE -u IWE_TEMPLATE -u IWE_GOVERNANCE_REPO \
+    -u IWE_EXECUTOR_CATALOG -u IWE_ROUTER_AUDIT -u IWE_ROUTER_ERRORS \
+    bash "$NOENV_ROOT/FMT-exocortex-template/scripts/route-task.sh" --skill consent --args "status" 2>&1)
+actual=$?
+set -e
+rm -rf "$NOENV_ROOT"
+if [[ "$actual" -eq 2 ]] && ! echo "$T18_OUT" | grep -q "not found"; then
+    echo "PASS (exit $actual — self-located its own nested root, found the real catalog, never guessed \$HOME/IWE)"
+    ((PASS++)) || true
+else
+    echo "FAIL: expected exit 2 (catalog found via self-location), got $actual: $T18_OUT"
+    ((FAIL++)) || true
+fi
+echo ""
+
 # 15-17. The generator's compound executor taxonomy must be executable by the
 # consumer, not merely accepted into a catalog that route-task cannot use.
 echo "=== T15-T17: agent and script+judgment executor modes ==="

@@ -175,7 +175,7 @@ bash .claude/scripts/load-extensions.sh archgate before
 
 **Классификация данных (B7.3.1) — БЛОКИРУЮЩЕЕ для РП с PII / payment_credentials / secrets:**
 
-Source-of-truth: `{{WORKSPACE_DIR}}/DS-ecosystem-development/C.IT-Platform/C2.IT-Platform/C2.2.Architecture/Data-Governance/B7.3.1-l2-data-classification-map.md` (если файл не найден — ищи в своём DS-ecosystem-development-репо). Если затрагивается чувствительный класс — пройти 6 пунктов:
+Source-of-truth: `C.IT-Platform/C2.IT-Platform/C2.2.Architecture/Data-Governance/B7.3.1-l2-data-classification-map.md` в своём ecosystem-development репозитории, если он есть. Если затрагивается чувствительный класс — пройти 6 пунктов:
 
 1. **Класс данных?** public / PII / payment_credentials / secrets — определить по тестам §1 B7.3.1. Если только public → §Б пропустить остальное.
 2. **Слой?** L1 / L2 / L3 / L4 — проверить таблицу B7.3.1 §2 «где какие классы могут жить». Размещение запрещено таблицей = ❌.

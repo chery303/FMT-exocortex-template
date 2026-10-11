@@ -13,12 +13,12 @@ related:
 
 # Agent Inbox — спецификация конвейера агентных задач IWE
 
-> **Назначение:** единое место в governance-репо, где пилот ставит задачу агенту «на потом» и забирает результат при открытии дня. Поверх существующей инфраструктуры (claude.ai CCR + tsekh-1 systemd), не вместо.
+> **Назначение:** единое место в governance-репо, где пилот ставит задачу агенту «на потом» и забирает результат при открытии дня. Поверх существующей инфраструктуры (claude.ai CCR + systemd на личном сервере), не вместо.
 
 ## 1. Проблема
 
 Из Ф1-инвентаризации (18 рутин, 4 канала):
-1. **Постановка задачи разбросана** — inline в `RemoteTrigger create`, bash-скрипты на tsekh-1, ad-hoc CLI вызовы. Нельзя посмотреть список «что висит для агента» одним местом.
+1. **Постановка задачи разбросана** — inline в `RemoteTrigger create`, bash-скрипты на личном сервере, ad-hoc CLI вызовы. Нельзя посмотреть список «что висит для агента» одним местом.
 2. **Шаблонов промптов нет** — каждый раз пишется заново. Удачные паттерны не накапливаются.
 3. **Куда падает результат — неоднозначно.** Один файл может оказаться на main, на feature branch, в PR, в Gmail, в Neon-таблице или просто в чате. Пилот не знает, где смотреть.
 4. **Lifecycle статусов невидимый.** Запустилось / упало / в работе / ждёт ввода — узнаётся только через explicit query (RemoteTrigger get, journalctl).
@@ -64,7 +64,7 @@ id: TASK-2026-05-17-analyze-section-11
 kind: analyze | scout | evolution | soak | retro | research | publish
 status: pending           # pending → assigned → in_progress → completed | failed | blocked
 priority: P0 | P1 | P2 | P3
-agent: ccr-opus | ccr-sonnet | tsekh-systemd | local-launchd
+agent: ccr-opus | ccr-sonnet | remote-systemd | local-launchd
 template: analyze-section # ссылка на templates/<name>.md
 created: 2026-05-17T14:30:00+03:00
 due: 2026-05-17T22:00:00+03:00       # когда должно быть запущено
@@ -151,7 +151,7 @@ artifact_url: https://github.com/aisystant/DS-principles-curriculum/blob/main/sp
 
 ## 6. Scout — алгоритм
 
-**Триггер:** CCR-рутина с `cron_expression: "0 4 * * *"` (04:00 UTC, после `overnight-scout.timer` на tsekh-1 в 04:00 MSK).
+**Триггер:** CCR-рутина с `cron_expression: "0 4 * * *"` (04:00 UTC — после локального `overnight-scout.timer`, если он настроен на сервере пилота).
 
 **Шаги:**
 1. Прочитать sources (заданы в trigger config): пилотные репо, ключевые dashboards, Issue-трекеры.
@@ -160,7 +160,7 @@ artifact_url: https://github.com/aisystant/DS-principles-curriculum/blob/main/sp
 4. Если есть findings с `priority: P0` → создать `tasks/` файл со `status: pending` (auto-promote).
 5. git push.
 
-**Связь с existing overnight-scout (B1):** систем-таймер на tsekh-1 продолжает работать (читает discord/twitter/hn fast-changing). CCR-Scout — другой профиль (читает медленные источники, требующие LLM-анализа: PR'ы Repo'ев, длинные posts, GitHub Issues с обсуждением). Не дублируют — комплементарны.
+**Связь с existing overnight-scout (B1):** существующий систем-таймер продолжает работать (читает discord/twitter/hn fast-changing). CCR-Scout — другой профиль (читает медленные источники, требующие LLM-анализа: PR'ы Repo'ев, длинные posts, GitHub Issues с обсуждением). Не дублируют — комплементарны.
 
 ## 7. Шаблоны промптов (templates/)
 
@@ -198,7 +198,7 @@ artifact_url: https://github.com/aisystant/DS-principles-curriculum/blob/main/sp
 | **М — Модульность** | ✅ | Чёткие границы: dispatcher не знает про специфику task'ов (читает template), templates не знают про dispatcher, result_location task'а не знает про реализацию push. Connascence — только по schema task-файла. |
 | **О — Открытость** | ✅ | Templates — пользовательский слой. Любой пилот добавляет свой template без изменения dispatcher-кода. Promotion в FMT-extensions — стандартный канал шаринга. |
 | **Г — Гомеостаз** | ⚠️ | Dispatcher lock защищает от параллельных запусков, retry-логика есть. **Слабое место:** если dispatcher CCR падает (timeout), задачи остаются в `assigned` без cleanup. Митигация — отдельный «sweeper» в Scout daily: задачи в `assigned` >2 часов → возвращаются в `pending` или помечаются `failed`. |
-| **С — Сохранность** | ✅ | Все артефакты в git: task-файлы, result-файлы, archive. Restic-backup tsekh-1 покрывает <governance-repo>. Idempotency через `task_id` в RemoteTrigger metadata. |
+| **С — Сохранность** | ✅ | Все артефакты в git: task-файлы, result-файлы, archive. Backup сервера пилота (если настроен) покрывает <governance-repo>. Idempotency через `task_id` в RemoteTrigger metadata. |
 | **С — Скорость** | ✅ | Часовой dispatcher — приемлемо для async-задач. Полу-реалтайм можно через `due: now()` + manual `RemoteTrigger run`. Latency dispatcher cycle ≤5 мин (clone + parse + N×RemoteTrigger create). |
 | **Б — Безопасность** | ⚠️ | Промпты в task-файлах коммитятся в git → возможен secret leak (если кто-то напишет токен в задаче). **Митигация:** (1) `.gitignore` для `inbox/agent/tasks/*-secrets-*.md`; (2) pre-commit hook grep на API_KEY/TOKEN; (3) явное правило в README «секреты — через env, не в задаче». Также: dispatcher не должен выполнять произвольный bash из task'а — только через template-обвязку. |
 
@@ -215,14 +215,14 @@ artifact_url: https://github.com/aisystant/DS-principles-curriculum/blob/main/sp
 ### Шаг 2. Сценарии (≥3)
 
 **Сценарий А: Анализ раздела руководства WP-321 (delayed batch).**
-- Кто: Tseren (пилот) ставит task'и для разделов 11-15.
+- Кто: пилот ставит task'и для разделов 11-15.
 - Когда: вечер выходного, не хочет ждать N часов до завершения 5 анализов.
 - Что делает: `Write inbox/agent/tasks/TASK-...-analyze-section-N.md` × 5, `git push`.
 - Что происходит: dispatcher в ближайший час забирает все 5, запускает 5 RemoteTrigger'ов параллельно.
 - Утром забирает: 5 result-файлов в `results/`, 5 файлов замечаний на main.
 
 **Сценарий Б: Soak-verify сервиса (отложенный one-shot).**
-- Кто: dev-роль (Tseren) после deploy.
+- Кто: пилот (dev-роль) после deploy.
 - Когда: deploy commit `abc1234`, хочет проверить через 24h.
 - Что делает: task с `due: 2026-05-18T11:00`, `template: soak-verify`, `service_name: multi-domain-projection-worker`.
 - Что происходит: dispatcher в указанный час запускает CCR, агент проверяет git log + посылает email-чеклист пилоту (паттерн WP-277).
@@ -263,11 +263,11 @@ artifact_url: https://github.com/aisystant/DS-principles-curriculum/blob/main/sp
 **Kind:** Coordinator Role — управляет очередью, не выполняет содержательную работу.
 **Owner Role:** IWE Platform.
 
-**Миссия:** Гарантировать, что pending task'и из `inbox/agent/` запускаются вовремя через подходящий канал (CCR / tsekh / local), и что результат фиксируется однозначно.
+**Миссия:** Гарантировать, что pending task'и из `inbox/agent/` запускаются вовремя через подходящий канал (CCR / remote-systemd / local), и что результат фиксируется однозначно.
 
 **Обязанности:**
 - Читать `inbox/agent/tasks/*.md` каждый час.
-- Сопоставлять `agent` → канал (ccr-opus → RemoteTrigger create, tsekh-systemd → SSH+systemd-run, local-launchd → osascript).
+- Сопоставлять `agent` → канал (ccr-opus → RemoteTrigger create, remote-systemd → SSH+systemd-run, local-launchd → osascript).
 - Применять template (substitution параметров).
 - Возвращать lifecycle: pending → assigned → in_progress → completed/failed/blocked.
 - Писать result-файл и audit-trail.

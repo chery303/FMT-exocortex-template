@@ -19,8 +19,8 @@ roles/extractor/scripts/extractor.sh	python3 "$prefilter_script" --report "$stra
 roles/synchronizer/scripts/dt-collect.sh	python3 "$SCRIPT_DIR/dt-collect-neon.py" "$DT_USER_ID" "$MERGED" 2>>"$LOG_FILE"
 scripts/archive-done-wp.sh	WP_CARD=$(python3 "$WP_LIST_SCRIPT" --list-cards --source inbox --fields wp,card --format tsv \
 scripts/codex-peer-adapter.sh	_LANG_RESULT=$(printf '%s' "$CODEX_OUTPUT" | python3 "$_LANG_CHECK" 2>/dev/null || true)
-scripts/codex-peer-adapter.sh	if python3 "$TEMPLATE_SCRIPTS/content-filter-apply.py" "$CONTENT_FILTER_MAP" \
-scripts/codex-peer-adapter.sh	python3 "$TEMPLATE_SCRIPTS/peer-adapter-filter.py"
+scripts/codex-peer-adapter.sh	if python3 "$SCRIPT_DIR/content-filter-apply.py" "$CONTENT_FILTER_MAP" \
+scripts/codex-peer-adapter.sh	python3 "$SCRIPT_DIR/peer-adapter-filter.py"
 scripts/codex-peer-adapter.sh	| python3 "$HINDSIGHT_SCRIPT" 2>/dev/null || true
 scripts/create-wp.sh	TRACKER_OUTPUT=$(python3 "$TRACKER_ADAPTER" create --context "$WP_FILE" --repository "$REPO" 2>&1 || true)
 scripts/create-wp.sh	python3 "$BUILD_ACTIVE_WP" \

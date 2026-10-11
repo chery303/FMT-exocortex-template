@@ -2,7 +2,7 @@
 # requires: IWE_GOVERNANCE_REPO set via iwe-env-bootstrap.sh (fallback: DS-strategy, same as other scripts)
 # day-close-lock.sh — git-native cross-machine lock against duplicate Day Close runs (WP-484 Ф2).
 #
-# Инцидент 17.07: сервер (tsekh-1) и пилот вручную закрыли один день независимо друг от друга,
+# Инцидент 17.07: сервер (удалённый) и пилот вручную закрыли один день независимо друг от друга,
 # gap обнаружился только в момент commit+push. Git log сам по себе неатомарен (read-then-act),
 # поэтому источник истины — сам факт push: кто раньше запушил "day-close-start:", тот и работает,
 # остальные видят чужой свежий маркер (или reject при попытке запушить свой) и останавливаются

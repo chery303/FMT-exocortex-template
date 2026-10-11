@@ -34,7 +34,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # guessed under $HOME - an install outside ~/IWE otherwise reads another
 # workspace's data without a single error.
 WORKSPACE="${IWE_WORKSPACE:-$HOME/IWE}"
-GOVERNANCE_DIR="${GOVERNANCE_DIR:-$WORKSPACE/DS-strategy}"
+# issue #1106: this fell back to the literal "DS-strategy" directly,
+# ignoring IWE_GOVERNANCE_REPO — every other script that resolves a
+# governance-repo path (roles/strategist/scripts/strategist.sh,
+# roles/synchronizer/scripts/daily-report.sh, roles/synchronizer/scripts/
+# templates/*.sh, roles/extractor/scripts/extractor.sh) nests the env var
+# inside the default instead.
+GOVERNANCE_DIR="${GOVERNANCE_DIR:-$WORKSPACE/${IWE_GOVERNANCE_REPO:-DS-strategy}}"
 LOG_DIR="$HOME/logs/synchronizer"
 DATE=$(date +%Y-%m-%d)
 LOG_FILE="$LOG_DIR/dt-collect-$DATE.log"

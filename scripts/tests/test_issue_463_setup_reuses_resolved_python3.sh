@@ -451,13 +451,14 @@ cp -R "$FAKE_HOME/IWE/.claude/skills/smoke-fixture" "$UPDATE_WORKSPACE/.claude/s
 
 UPDATE_FUNCTIONS="$TEST_ROOT/update-backfill-functions.sh"
 awk '
+  /^hash_file\(\)/ { capture=1 }
+  /^# === Detect directories ===/ { capture=0 }
   /^effective_governance_repo\(\)/ { capture=1 }
   /^record_rule_workspace_state\(\)/ { exit }
   capture { print }
 ' "$ROOT/update.sh" > "$UPDATE_FUNCTIONS"
 if ! grep -q '^backfill_executor_catalog()' "$UPDATE_FUNCTIONS" \
-    || ! grep -q '^backfill_derived_snapshot_updater()' "$UPDATE_FUNCTIONS" \
-    || ! grep -q '^backfill_executor_catalog_generator()' "$UPDATE_FUNCTIONS"; then
+    || ! grep -q '^apply_governance_script_policy()' "$UPDATE_FUNCTIONS"; then
     fail "could not extract update backfill functions"
 fi
 
@@ -471,8 +472,8 @@ UPDATE_SNIPPET="$TEST_ROOT/update-catalog-snippet.sh"
     echo "unset IWE_GOVERNANCE_REPO"
     cat "$UPDATE_FUNCTIONS"
     echo 'EFFECTIVE_GOVERNANCE_REPO=$(effective_governance_repo)'
-    echo "backfill_derived_snapshot_updater"
-    echo "backfill_executor_catalog_generator"
+    echo "apply_governance_script_policy scripts/update-derived-snapshot.py"
+    echo "apply_governance_script_policy scripts/generate-executor-catalog.py"
     echo "backfill_executor_catalog"
 } > "$UPDATE_SNIPPET"
 chmod +x "$UPDATE_SNIPPET"
@@ -480,7 +481,17 @@ chmod +x "$UPDATE_SNIPPET"
 git -C "$UPDATE_GOVERNANCE" init -q
 git -C "$UPDATE_GOVERNANCE" config user.name "Issue 508 update test"
 git -C "$UPDATE_GOVERNANCE" config user.email "issue-508@example.invalid"
-printf '#!/usr/bin/env python3\nSNAPSHOT_PATH = "${IWE_GOVERNANCE_REPO:-DS-strategy}"\n' \
+# WP-485 F17: the replaced git-dirty-state guard didn't care about file
+# content, so any synthetic placeholder here used to exercise the "replace
+# it" path. The new policy classifies by content against this repo's own
+# seed-path git history (classify-workspace-copy.sh) -- a placeholder that
+# was never a real release classifies as "unknown, keep it" instead, which
+# is correct new behaviour but defeats this specific fixture's intent. Use
+# an actual historical seed release (4f34412b, confirmed via git log -S not
+# to carry the unrelated bash-vs-python literal-string bug an even earlier
+# commit on this path has) so the fixture again represents what it is meant
+# to: an old-but-real release that should upgrade to current seed bytes.
+git -C "$ROOT" show 4f34412b:seed/strategy/scripts/update-derived-snapshot.py \
     > "$UPDATE_GOVERNANCE/scripts/update-derived-snapshot.py"
 chmod +x "$UPDATE_GOVERNANCE/scripts/update-derived-snapshot.py"
 git -C "$UPDATE_GOVERNANCE" add -- scripts/update-derived-snapshot.py

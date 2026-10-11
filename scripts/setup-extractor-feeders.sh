@@ -174,6 +174,10 @@ if [ "$PLATFORM" = "Darwin" ]; then
         CLAUDE_BIN_DIR="$(dirname "$(command -v "$AI_CLI")")"
         PLIST_PATH="$CLAUDE_BIN_DIR:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
         IWE_TEMPLATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        # issue #984: extractor.sh resolves session-guard.sh as ${IWE_SCRIPTS:-$HOME/IWE/scripts};
+        # without this key launchd runs it with the fallback, which does not exist,
+        # and the feed is verified but never saved.
+        IWE_SCRIPTS="${IWE_SCRIPTS:-$IWE_TEMPLATE_DIR/scripts}"
         NEW_PLIST_CONTENT=$(cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -202,6 +206,7 @@ if [ "$PLATFORM" = "Darwin" ]; then
         <key>IWE_WORKSPACE</key><string>$IWE_WORKSPACE</string>
         <key>IWE_GOVERNANCE_REPO</key><string>$GOVERNANCE_REPO</string>
         <key>IWE_RUNTIME</key><string>$IWE_RUNTIME</string>
+        <key>IWE_SCRIPTS</key><string>$IWE_SCRIPTS</string>
     </dict>
 </dict></plist>
 PLIST
@@ -213,7 +218,11 @@ PLIST
         # content is unchanged AND the job is actually loaded -- content
         # unchanged but not loaded (e.g. a prior `launchctl unload` left it
         # stopped) must still fall through to `load`.
-        if [ -f "$PLIST" ] && [ "$(cat "$PLIST")" = "$NEW_PLIST_CONTENT" ] \
+        if [ -n "${SETUP_CI:-}" ]; then
+            # Issue #1006 (#1010 F6): CI and smoke runs must never touch the real launchd session.
+            printf '%s\n' "$NEW_PLIST_CONTENT" > "$PLIST"
+            ok "SETUP_CI: plist записан в $PLIST, активация launchctl пропущена"
+        elif [ -f "$PLIST" ] && [ "$(cat "$PLIST")" = "$NEW_PLIST_CONTENT" ] \
             && launchctl list "com.extractor.git-diff-feed" >/dev/null 2>&1; then
             ok "launchd plist уже установлен и активен, без изменений"
         else
@@ -253,9 +262,13 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 TIMER
-        systemctl --user daemon-reload
-        systemctl --user enable --now extractor-git-diff-feed.timer
-        ok "systemd timer установлен и активирован"
+        if [ -n "${SETUP_CI:-}" ]; then
+            ok "SETUP_CI: units записаны в $UNIT_DIR, активация systemd пропущена"
+        else
+            systemctl --user daemon-reload
+            systemctl --user enable --now extractor-git-diff-feed.timer
+            ok "systemd timer установлен и активирован"
+        fi
     fi
 fi
 

@@ -33,6 +33,18 @@ case "$PAYLOAD" in
         FILE_PATH=$(printf '%s' "$PAYLOAD" | sed -E 's/.*"file_path":[[:space:]]*"([^"]+)".*/\1/' | head -n1)
         ;;
 esac
+# NotebookEdit's real tool_input key is "notebook_path", not "file_path" --
+# without this branch the guard silently passed through every NotebookEdit
+# call despite listing it in the tool-name allow-list two lines below
+# (found by adversarial review, 2026-10-06: a real NotebookEdit payload
+# targeting SPF/ was not blocked).
+if [ -z "$FILE_PATH" ]; then
+    case "$PAYLOAD" in
+        *'"notebook_path"'*)
+            FILE_PATH=$(printf '%s' "$PAYLOAD" | sed -E 's/.*"notebook_path":[[:space:]]*"([^"]+)".*/\1/' | head -n1)
+            ;;
+    esac
+fi
 
 # Защищаем только Write/Edit/MultiEdit/NotebookEdit
 case "$TOOL_NAME" in
@@ -40,8 +52,14 @@ case "$TOOL_NAME" in
     *) exit 0 ;;
 esac
 
-# Проверяем path на блокируемые директории
-IWE_HOME="${HOME}/IWE"
+# Проверяем path на блокируемые директории. $CLAUDE_PROJECT_DIR is Claude
+# Code's own, always-set-in-a-real-session project root (same idiom already
+# used in inject-fault-profile.sh and sibling hooks) -- a bare "$HOME/IWE"
+# guessed wrong on any non-default workspace location, the same bug class
+# issue #1094 fixes elsewhere in this template (found by adversarial
+# review, 2026-10-06). The bare fallback stays only for this hook's own
+# unit test, which runs outside a real Claude Code session.
+IWE_HOME="${CLAUDE_PROJECT_DIR:-$HOME/IWE}"
 case "$FILE_PATH" in
     "$IWE_HOME"/SPF/*|"$IWE_HOME"/FPF/*)
         cat >&2 <<EOF

@@ -54,7 +54,7 @@ expect "deploy-key add с -w блокируется" block \
 expect "deploy-key add с --allow-write блокируется" block \
   'gh repo deploy-key add key.pub --repo Owner/Repo --title "sync" --allow-write'
 expect "deploy-key add без -w НЕ блокируется (read-only default, обычный ask)" pass \
-  'gh repo deploy-key add key.pub --repo Owner/Repo --title "tsekh-1 read-only sync"'
+  'gh repo deploy-key add key.pub --repo Owner/Repo --title "remote-host read-only sync"'
 expect "gh repo delete по-прежнему блокируется (регресс)" block \
   'gh repo delete Owner/Repo --yes'
 # Cold-review find (WP-544, 2026-09-04): whole-command grep required a bare

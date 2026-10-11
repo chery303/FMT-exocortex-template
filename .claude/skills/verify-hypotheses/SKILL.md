@@ -81,7 +81,7 @@ Output: изменения сохранены, история гипотез н�
 ## Verification
 
 ```bash
-bash scripts/verify-skill.sh verify-hypotheses
+bash .claude/skills/skill-creator/scripts/verify-skill.sh verify-hypotheses
 ```
 Ожидаемый результат: PASS. Живая проверка — вызвать скилл вручную после 2026-09-01 (дата сверки первой записи H-001 в `hypotheses-log.md`), убедиться, что алгоритм находит именно эту запись и не находит других (журнал сейчас содержит только H-001).
 

@@ -20,7 +20,7 @@ git diff --cached --name-only -z > "$SNAP/staged-paths.z"
 find . -type d -empty -not -path './.git/*' | sort > "$SNAP/empty-dirs.txt"
 # GNU-first (Linux/coreutils), BSD fallback (macOS) -- same order and same
 # rationale as iwe_file_mtime_date() in scripts/lib/common.sh: this pilot's
-# own hosts span both (Mac + tsekh-1 Linux), and the reverse check order has
+# own hosts span both (Mac + a remote Linux server), and the reverse check order has
 # previously broken the Linux branch of stat -f/-c detection.
 portable_stat_line() {  # <path> -- "type perm size mtime", one format picked once per host
   if stat --version >/dev/null 2>&1; then

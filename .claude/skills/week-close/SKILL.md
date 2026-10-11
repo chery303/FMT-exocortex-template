@@ -21,7 +21,7 @@ gates_rationale: "операционный скилл; WP Gate применим 
 
 # Week Close (протокол закрытия недели)
 
-> **Роль:** R1 Стратег. **Бюджет:** ~30 мин.
+> **Роль:** Плановик (DP.ROLE.066) ведёт недельный ритуал; Стратег (R1) подключается по триггеру пересмотра приоритетов (DP.SC.051). **Бюджет:** ~30 мин.
 > **Принцип:** SKILL.md = L1 платформенный файл. Пользователь не редактирует напрямую — только через `extensions/`.
 > **Стиль текста:** ретро недели и новый WeekPlan читает пилот → весь текст синтезировать в базе разговорного стиля (S0 база + S1 автор, источник DP.SC.050): русский, без машинных меток, главная мысль первой, код РП и путь не подлежащее.
 
@@ -109,7 +109,7 @@ WP-NNN: pending-фазы (M):
 - Просмотреть `inbox/fleeting-notes.md` за неделю → маршрутизировать невыключенные.
 - Уроки сессий → MEMORY.md + thematic `lessons_*.md` (если есть).
 - Drift-scan недели: что в MEMORY.md устарело за 7 дней.
-- **Проверка полноты переноса перед архивацией (WP-5, 2026-07-10):** `bash {{IWE_SCRIPTS}}/check-wp-transfer-completeness.sh --all {{IWE_ROOT}}` по `inbox/WP-N/` — выводит `results_not_captured`-флаги (проставленные при закрытии без заполненного `results_in`) и файлы в подпапках без учёта в основном контекст-файле. Для каждого warning — пилот решает: (a) действительно нужен перенос знания, найти куда; (b) файл технический/устарел, можно оставить; (c) `results_in` заполнить постфактум. Не блокирует Close.
+- **Проверка полноты переноса перед архивацией (WP-5, 2026-07-10):** `bash {{IWE_SCRIPTS}}/check-wp-transfer-completeness.sh --all "${IWE_ROOT:-$HOME/IWE}"` по `inbox/WP-N/` — выводит `results_not_captured`-флаги (проставленные при закрытии без заполненного `results_in`) и файлы в подпапках без учёта в основном контекст-файле. Для каждого warning — пилот решает: (a) действительно нужен перенос знания, найти куда; (b) файл технический/устарел, можно оставить; (c) `results_in` заполнить постфактум. Не блокирует Close.
 
 ### 6a. Сверка журнала гипотез (LPF, WP-496)
 
@@ -181,9 +181,11 @@ bash ${IWE_SCRIPTS}/memory-bleed.sh
 > Проверка здоровья статической нагрузки контекста. Флаги — информативно, пользователь решает.
 
 ```bash
+IWE_ROOT="${IWE_ROOT:-$HOME/IWE}"
+MEMORY_DIR="$IWE_ROOT/memory"
 echo "=== distinctions.md ===" && wc -l {{WORKSPACE_DIR}}/.claude/rules/distinctions.md
-echo "=== MEMORY.md ===" && wc -l {{MEMORY_DIR}}/MEMORY.md
-echo "=== memory/ файлы (mtime >14д) ===" && find {{MEMORY_DIR}} -name "*.md" -mtime +14 -not -name "MEMORY.md" -not -path "*/archive/*" | sort
+echo "=== MEMORY.md ===" && wc -l "$MEMORY_DIR/MEMORY.md"
+echo "=== memory/ файлы (mtime >14д) ===" && find "$MEMORY_DIR" -name "*.md" -mtime +14 -not -name "MEMORY.md" -not -path "*/archive/*" | sort
 ```
 
 | Метрика | Порог | Действие |
@@ -253,7 +255,7 @@ fi
 ### 11. Закоммитить governance-репо
 
 ```bash
-cd {{WORKSPACE_DIR}}/{{GOVERNANCE_REPO}}
+(cd {{WORKSPACE_DIR}}/{{GOVERNANCE_REPO}}
 git status --short
 # НЕ git add -A/git add ./git add -u — AGENTS.md CRITICAL (может захватить работу других агентов)
 # Стейджить ТОЛЬКО файлы, изменённые в шагах 1-10 (в массив для pathspec):
@@ -263,6 +265,7 @@ git diff --cached --name-only  # проверить scope — только week-
 # pathspec после `--`: commit ТОЛЬКО свои файлы, не подметаем чужой индекс
 git commit -m "week-close: W{N} итоги q:{score}" -- "${WC_FILES[@]}"
 git push
+)
 ```
 
 ### 12. Верификация (Haiku R23)

@@ -58,7 +58,7 @@ updated: YYYY-MM-DD
 | Фильтровать: `status: pending` AND `due ≤ now()` | python list comprehension |
 | Сортировать по `priority` | P0 → P1 → P2 → P3 |
 | Подставлять параметры в template | jinja2-like substitution `{{var}}` |
-| Запускать через канал | `agent: claude-cli` → `claude -p` headless; `agent: ccr-opus` → `RemoteTrigger create`; `agent: tsekh-systemd` → `systemd-run`; `agent: local-launchd` → osascript |
+| Запускать через канал | `agent: claude-cli` → `claude -p` headless; `agent: ccr-opus` → `RemoteTrigger create`; `agent: remote-systemd` → `systemd-run`; `agent: local-launchd` → osascript |
 | Записывать `trigger_id` + `status: assigned` | git Edit + commit + push |
 | Проверять acceptance | acceptance-check скрипт (часть dispatcher impl) |
 | Создавать result-файл | Write `RESULT-<task-id>.md` + git commit |

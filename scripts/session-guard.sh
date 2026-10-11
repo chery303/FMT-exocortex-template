@@ -43,6 +43,16 @@
 
 set -euo pipefail
 
+# The transition lock below uses Unix fcntl, inode ownership and /bin/bash.
+# Git Bash with native Windows Python cannot uphold that contract. Refuse every
+# command before creating the session directory or touching the canonical repo.
+case "$(uname -s)" in
+  MINGW*|MSYS*)
+    echo 'session-guard: Git Bash на Windows с нативным Python не поддерживается: Unix-блокировка fcntl недоступна. Запустите рабочую сессию в WSL2.' >&2
+    exit 1
+    ;;
+esac
+
 IWE_ROOT="${IWE_ROOT:-$HOME/IWE}"
 SESSION_GUARD_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 # issue #266: hardcoded "DS-strategy" broke every template user whose
@@ -1545,17 +1555,20 @@ if [ "$CMD" = "open" ]; then
     ISOLATE_BASE_DIR="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     [ -n "$ISOLATE_BASE_DIR" ] || fail "--isolate: текущий каталог не git-репозиторий" 1
     if [ -n "${BASE_SHA:-}" ]; then
-      git -C "$ISOLATE_BASE_DIR" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+      GIT_NO_LAZY_FETCH=1 git -C "$ISOLATE_BASE_DIR" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
         || fail "--isolate: --base-sha '$BASE_SHA' не является коммитом в ($ISOLATE_BASE_DIR)" 1
+      # A partial clone can have the commit but not its blobs. worktree add
+      # otherwise fetches them implicitly from the promisor remote. Probe all
+      # reachable objects without lazy fetch before creating a branch.
+      if ! ISOLATE_LOCAL_OBJECTS=$(GIT_NO_LAZY_FETCH=1 git -C "$ISOLATE_BASE_DIR" rev-list --objects --missing=print "$BASE_SHA" 2>/dev/null); then
+        fail "--isolate: не удалось проверить локальные объекты --base-sha '$BASE_SHA'; канон не изменён" 1
+      fi
+      if printf '%s\n' "$ISOLATE_LOCAL_OBJECTS" | grep -q '^?'; then
+        fail "--isolate: --base-sha '$BASE_SHA' неполон локально (отсутствуют объекты partial clone); подключись к origin и догрузи объекты либо выбери полный локальный коммит. Канон не изменён" 1
+      fi
     fi
-    ISOLATE_BASE_ORIGIN="$(git -C "$ISOLATE_BASE_DIR" remote get-url origin 2>/dev/null || printf '%s\n' "no-origin")"
-    case "$ISOLATE_BASE_ORIGIN" in
-      *://*@*)
-        _sch="${ISOLATE_BASE_ORIGIN%%://*}"; _rest="${ISOLATE_BASE_ORIGIN#*://}"
-        ISOLATE_BASE_ORIGIN="${_sch}://${_rest##*@}"
-        ;;
-    esac
-    printf 'session-guard: --isolate: изолирую %q (origin: %q)\n' "$ISOLATE_BASE_DIR" "$ISOLATE_BASE_ORIGIN" >&2
+    # A remote URL can carry credentials in userinfo, path, query or fragment.
+    printf 'session-guard: --isolate: изолирую %q (remote: origin)\n' "$ISOLATE_BASE_DIR" >&2
     ISOLATE_STORE_DIR="$IWE_ROOT/.iwe-runtime/isolated-worktrees"
     mkdir -p "$ISOLATE_STORE_DIR"
     ISOLATE_STORE_DIR_REAL="$(realpath "$ISOLATE_STORE_DIR")"
@@ -1615,14 +1628,37 @@ if [ "$CMD" = "open" ]; then
         return 0
       fi
       if [ -z "${BASE_SHA:-}" ]; then
-        git -C "$ISOLATE_BASE_DIR" fetch origin main >/dev/null 2>&1 \
-          || fail "--isolate: git fetch origin main не удался" 1
+        local fetch_error fetch_reason fetch_rc local_sha offline_command
+        local offline_args
+        if fetch_error=$(LC_ALL=C GIT_TERMINAL_PROMPT=0 git -C "$ISOLATE_BASE_DIR" fetch origin main 2>&1); then
+          :
+        else
+          fetch_rc=$?
+          # Git may echo credentials embedded in a remote URL. Report only a
+          # classified cause; the pilot can inspect the raw error locally.
+          case "$fetch_error" in
+            *"Could not resolve host"*|*"Name or service not known"*) fetch_reason="имя сервера не разрешается" ;;
+            *"Failed to connect"*|*"Connection refused"*|*"Network is unreachable"*|*"Could not connect"*) fetch_reason="нет соединения с origin" ;;
+            *"Authentication failed"*|*"Permission denied (publickey)"*|*"could not read Username"*) fetch_reason="ошибка авторизации origin" ;;
+            *"couldn't find remote ref main"*) fetch_reason="на origin нет ветки main" ;;
+            *) fetch_reason="причина не классифицирована; проверь git fetch origin main локально" ;;
+          esac
+          echo "session-guard: --isolate: origin/main недоступен: $fetch_reason (git fetch, код $fetch_rc)." >&2
+          local_sha=$(git -C "$ISOLATE_BASE_DIR" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)
+          if [ -n "$local_sha" ]; then
+            printf 'session-guard: Проверь локальную ревизию: git -C %q show -s --format=%%H\\ %%s %q\n' "$ISOLATE_BASE_DIR" "$local_sha" >&2
+            offline_args=(bash "$SESSION_GUARD_SELF" open --isolate --wp "$WP" --task "$TASK" --slug "$SLUG" --agent "$AGENT" --base-sha "$local_sha")
+            [ -n "$SESSION_ID_ARG" ] && offline_args+=(--session-id "$SESSION_ID_ARG")
+            printf -v offline_command '%q ' "${offline_args[@]}"
+            printf 'session-guard: Офлайн после проверки ревизии: (cd -- %q && %s)\n' "$ISOLATE_BASE_DIR" "$offline_command" >&2
+          fi
+          return 1
+        fi
         git -C "$ISOLATE_BASE_DIR" worktree add -b "$ISOLATED_WORKTREE_BRANCH" "$ISOLATED_WORKTREE_PATH" origin/main \
           || fail "--isolate: git worktree add не удался" 1
       else
-        # Pin exact commit; still refresh remotes best-effort so origin stays usable for later push
-        git -C "$ISOLATE_BASE_DIR" fetch origin main >/dev/null 2>&1 || true
-        git -C "$ISOLATE_BASE_DIR" worktree add -b "$ISOLATED_WORKTREE_BRANCH" "$ISOLATED_WORKTREE_PATH" "$BASE_SHA" \
+        # An explicit local commit is the offline path: no remote query here.
+        GIT_NO_LAZY_FETCH=1 git -C "$ISOLATE_BASE_DIR" worktree add -b "$ISOLATED_WORKTREE_BRANCH" "$ISOLATED_WORKTREE_PATH" "$BASE_SHA" \
           || fail "--isolate: git worktree add от --base-sha не удался" 1
       fi
       real=$(realpath "$ISOLATED_WORKTREE_PATH" 2>/dev/null || echo "$ISOLATED_WORKTREE_PATH")

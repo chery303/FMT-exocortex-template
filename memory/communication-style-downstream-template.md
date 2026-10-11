@@ -20,7 +20,7 @@ schema_version: 1
 ## Стиль общения
 
 Стиль общения - по `communication-style-base.md`.
-Базовые правила inline ниже (синхронизируются скриптом `scripts/sync-communication-style.sh`).
+Базовые правила inline ниже (синхронизируются скриптом `scripts/sync-communication-style.py`).
 Дополнительные правила этого канала или роли - ниже.
 
 <!-- COMMUNICATION-STYLE-BASE-START -->
@@ -58,4 +58,4 @@ schema_version: 1
 1. Скопируй блок «Стиль общения» выше в свой файл.
 2. Не трогай содержимое между `<!-- COMMUNICATION-STYLE-BASE-START -->` и `<!-- COMMUNICATION-STYLE-BASE-END -->`.
 3. Допиши свои channel-specific правила ниже.
-4. Зарегистрируй путь в `scripts/sync-communication-style.sh`.
+4. Зарегистрируй путь в `scripts/sync-communication-style.yaml` (создай из `scripts/sync-communication-style.yaml.example`, если файла ещё нет — он author-local и в git не входит).

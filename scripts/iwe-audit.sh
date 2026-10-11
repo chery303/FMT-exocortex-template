@@ -861,7 +861,7 @@ echo ""
 # root-owned объекты — последующий pull под обычным юзером падает с
 # "insufficient permission for adding an object to repository database".
 #
-# Источник: 11→12 мая 2026, dirty pull-repos warnings на tsekh-1 — корень оказался
+# Источник: 11→12 мая 2026, dirty pull-repos warnings на удалённом сервере пилота — корень оказался
 # в root-owned .git/objects после ssh-as-root команд из mac.
 #
 # Релевантно для Linux (где ssh может ходить под разными user). На macOS обычно

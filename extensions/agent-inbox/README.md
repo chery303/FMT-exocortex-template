@@ -28,7 +28,7 @@
    - `id` — соответствует имени файла
    - `kind` — что за тип задачи (см. SPEC §3)
    - `priority` — P0 (critical), P1 (high), P2 (medium), P3 (low)
-   - `agent` — канал исполнения (`ccr-opus` / `ccr-sonnet` / `tsekh-systemd` / `local-launchd`)
+   - `agent` — канал исполнения (`ccr-opus` / `ccr-sonnet` / `remote-systemd` / `local-launchd`)
    - `due` — когда должно быть запущено
    - `result_location` — **обязательно**: repo + branch + path. Единственная точка истины.
    - `acceptance` — критерии готовности
@@ -79,7 +79,7 @@ pending ─→ assigned ─→ in_progress ─→ completed | failed | blocked
 ## Roadmap
 
 1. Разобраться с RemoteTrigger v2 API → разблокировать автоматический dispatcher.
-2. Альтернатива (если v2 API долго): локальный dispatcher на tsekh-1 (systemd timer + Python + RemoteTrigger v1 API через сохранённый OAuth) — даёт ту же функциональность без зависимости от CCR-окружения.
+2. Альтернатива (если v2 API долго): локальный dispatcher на личном сервере (systemd timer + Python + RemoteTrigger v1 API через сохранённый OAuth) — даёт ту же функциональность без зависимости от CCR-окружения.
 3. Promotion в FMT (Ф6 WP-324) — `extensions/agent-inbox/` шаблон для других IWE-инсталляций.
 
 ## Связанные документы

@@ -19,7 +19,7 @@ for secret_bypass_candidate in /opt/homebrew/bin/jq /usr/local/bin/jq /usr/bin/j
   fi
 done
 # 2026-08-25: none of the hardcoded FHS paths above exist on NixOS hosts
-# (tsekh-1) - jq and python3 live under /run/current-system/sw/bin there,
+# (e.g. a pilot's remote server) - jq and python3 live under /run/current-system/sw/bin there,
 # not under /usr or /opt/homebrew. The hardcoded loop stayed as the fast
 # common-case path; this PATH-based fallback covers NixOS and any other
 # layout without hardcoding one more absolute path per host.

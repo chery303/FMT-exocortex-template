@@ -5,8 +5,8 @@
 set -e
 
 # issue #657: this script needs more than one independent EXIT cleanup (kill
-# the sleep inhibitor below; remove acquire_lock()'s concurrency lock
-# directory further down) — plain `trap ... EXIT` only keeps the LAST
+# the sleep inhibitor below; release acquire_lock()'s owner links
+# further down) — plain `trap ... EXIT` only keeps the LAST
 # handler registered for a signal, so the second one silently replaced the
 # first on every ordinary run, not just on kill -9/orphaning as first
 # suspected. Register cleanups here instead of calling `trap` directly.
@@ -20,6 +20,11 @@ run_exit_cleanups() {
         eval "$cmd" 2>/dev/null || true
     done
 }
+# Bash may keep running after SIGINT while a foreground child returns; turn
+# interruption into an exit so the composed EXIT cleanup releases this run's
+# links and the scheduler can retry instead of inheriting an occupied lock.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap run_exit_cleanups EXIT
 
 # Sleep inhibitor for the WHOLE script lifetime (issue #553: direct launchd
@@ -79,14 +84,15 @@ fi
 # WP-529 F6 (Evgenii post-update defect #1, 18.08): update.sh reinstalls
 # auto-roles while .update-incomplete is still present (the transaction closes
 # at the very end), and launchctl load fires RunAtLoad right away — a mutating
-# agent run started mid-update at 22:38. Skip every scenario while an update
-# is open; the next scheduled run picks it up. Template root is resolved as
+# agent run started mid-update at 22:38. Defer every scenario with a temporary
+# failure so the scheduler does not mark it done (#1029). The next scheduled
+# run picks it up. Template root is resolved as
 # $IWE_TEMPLATE first, then ${IWE_WORKSPACE:-$HOME/IWE}/FMT-exocortex-template
 # (NOT identical to the PROMPTS_DIR fallback below, which hardcodes $HOME/IWE).
 UPDATE_MARKER="${IWE_TEMPLATE:-${IWE_WORKSPACE:-$HOME/IWE}/FMT-exocortex-template}/.update-incomplete"
 if [ -f "$UPDATE_MARKER" ]; then
-    echo "[$(date '+%H:%M:%S')] SKIP: template update in progress ($UPDATE_MARKER present) — no mutating run during update" >&2
-    exit 0
+    echo "[$(date '+%H:%M:%S')] BLOCKED: template update incomplete ($UPDATE_MARKER present) — no mutating run; finish or repair update.sh, then retry" >&2
+    exit 75
 fi
 
 # PROMPTS_DIR резолв: $IWE_TEMPLATE (Generated runtime) → $HOME/IWE/FMT-exocortex-template (default) → relative (legacy fallback)
@@ -275,6 +281,7 @@ notify_telegram() {
 # foreign one that touches the same file -- the exact path keeps that window narrow.
 DELIVERY_POSTCONDITION_RC=70
 WEEK_REVIEW_MAX_FAILED_RUNS=2
+WEEK_REVIEW_EXHAUSTED_RC=76  # scheduler suppresses further automatic runs today; never weekly done
 
 expected_delivery_path() {  # <scenario> -> :(glob) pathspec in the governance repo, empty = none
     case "$1" in
@@ -495,9 +502,10 @@ isolation_enabled() {  # <scenario>; 0 = listed in STRATEGIST_ISOLATED_SCENARIOS
 # An allowlist is exact repo-relative paths, so a scenario gets one only where its prompt fixes every
 # path it writes (checked against roles/strategist/prompts/, WP-530 Ф72 steps V-D). Scenarios left
 # out, and why -- each is refused with rc=72 when listed, never run un-isolated:
-#   day-plan     the primary morning path is scripts/day-open-pipeline.sh (its own commit/push and state
-#                files, not run_claude); the run_claude prompt builds its paths from $IWE_WORKSPACE (the
-#                canon) and commits/pushes itself, so a copy would not catch its writes.
+#   day-plan     the morning path is only scripts/day-open-pipeline.sh (its own commit/push and state
+#                files, not run_claude); the run_claude prompt (manual `strategist.sh day-plan` only)
+#                builds its paths from $IWE_WORKSPACE (the canon) and commits/pushes itself, so a copy
+#                would not catch its writes.
 #   evening      the prompt says only "update the day plan" (which file is not stated).
 #   day-close    deprecated prompt: WeekPlan W*.md (dynamic name), MEMORY.md and exocortex/ backup
 #                copies of a directory glob (outside the repo or a dynamic file list).
@@ -707,10 +715,35 @@ log_size_bytes() {  # -> size of the daily log in bytes, 0 when there is none
 AI_CLI_OUT_START=""
 AI_CLI_OUT_END=""
 
+# Issue #1006: the shared helper ships with the template ($IWE_TEMPLATE/scripts/lib); the workspace
+# has no scripts/lib on a typical install, so looking only there left calendar_source at "connector"
+# for every scenario. Template first, then its default place, then the workspace.
+find_common_sh() {
+    local _ws="${IWE_WORKSPACE:-$HOME/IWE}" _base
+    for _base in "${IWE_TEMPLATE:-}" "$_ws/FMT-exocortex-template" "$_ws"; do
+        if [ -n "$_base" ] && [ -f "$_base/scripts/lib/common.sh" ]; then
+            printf '%s\n' "$_base/scripts/lib/common.sh"
+            return 0
+        fi
+    done
+    return 1
+}
+
 run_claude() {
     local command_file="$1"
     # Опциональная модель: второй аргумент или IWE_STRATEGIST_MODEL из env.
-    # Приоритет: аргумент > env > пустая строка (дефолт Claude CLI).
+    # Приоритет: аргумент > env > params.yaml (ниже, issue #1092) > сценарный
+    # дефолт, зашитый в код > пустая строка (дефолт Claude CLI). Пустая
+    # строка здесь значит «ничего не задано», не «использовать CLI-дефолт
+    # прямо сейчас» — до дефолта очередь дойдёт только если params.yaml
+    # тоже молчит про этот сценарий.
+    # Поведенческая правка issue #1092 (cold review, Fable): до этого issue
+    # 5 из 7 сценариев передавали аргумент литералом напрямую из call site,
+    # поэтому IWE_STRATEGIST_MODEL для них не делал вообще ничего (литерал
+    # аргумента всегда выигрывал). Сейчас эти 5 call sites передают "",
+    # поэтому ENV для них стал реально действовать — раньше мёртвая
+    # возможность, теперь рабочая; в репозитории сейчас никто эту
+    # переменную не задаёт, поведение существующих установок не меняется.
     local model_override="${2:-${IWE_STRATEGIST_MODEL:-}}"
     local command_path="$PROMPTS_DIR/$command_file.md"
     AI_CLI_OUT_START=""
@@ -744,15 +777,47 @@ run_claude() {
         -e "s|${_o}GITHUB_USER${_c}|$_gh_user|g" \
         "$command_path") || { log "ERROR: не удалось прочитать промпт $command_path (sed)"; return 1; }
 
+    # issue #1092: scenario default computed unconditionally, same literals
+    # as before this issue -- common.sh missing (old install) must still
+    # give the exact old hardcoded model, not fall through to the bare CLI
+    # default below.
+    local _scenario_default=""
+    case "$command_file" in
+        week-review) _scenario_default="claude-opus-4-7" ;;
+        session-prep|day-plan|day-close) _scenario_default="claude-sonnet-4-6" ;;
+        note-review) _scenario_default="claude-haiku-4-5-20251001" ;;
+    esac
+
     # issue #942: calendar_source (params.yaml) = connector | script | none.
     # Without the shared helper (old install) the calendar stays on, as before.
-    local calendar_source="connector" _iwe_common="${IWE_WORKSPACE:-$HOME/IWE}/scripts/lib/common.sh"
-    if [ -f "$_iwe_common" ]; then
+    local calendar_source="connector" _iwe_common
+    _iwe_common=$(find_common_sh) || _iwe_common=""
+    if [ -n "$_iwe_common" ]; then
         # shellcheck source=/dev/null
         . "$_iwe_common" || { log "ERROR: не удалось загрузить $_iwe_common"; return 1; }
         calendar_source=$(iwe_calendar_source "${IWE_WORKSPACE:-$HOME/IWE}/params.yaml") \
             || { log "ERROR: iwe_calendar_source не отработал"; return 1; }
+
+        # model_override is still empty here only when neither the caller
+        # nor IWE_STRATEGIST_MODEL named one. params.yaml gets a say before
+        # the scenario default -- this is the same common.sh already loaded
+        # two lines above for calendar_source, not a second source of it.
+        # type-check first (cold review, issue #1092): an older common.sh
+        # found on $PATH ahead of a fresh template copy would have
+        # iwe_calendar_source but not yet this function -- treat that the
+        # same as "no common.sh found" (fall back to the hardcoded default),
+        # not as a hard failure that skips the whole scenario.
+        if [ -z "$model_override" ] && [ -n "$_scenario_default" ] \
+            && type iwe_scheduler_model >/dev/null 2>&1; then
+            model_override=$(iwe_scheduler_model "scheduler_model_${command_file//-/_}" \
+                "$_scenario_default" "${IWE_WORKSPACE:-$HOME/IWE}/params.yaml") \
+                || { log "ERROR: iwe_scheduler_model не отработал для $command_file"; return 1; }
+        fi
     fi
+    # common.sh missing, or this command_file has no scenario default (e.g.
+    # "evening", "strategy-session" -- never had a hardcoded model): leave
+    # model_override as whatever it already was (caller arg, env, or empty).
+    [ -n "$model_override" ] || model_override="$_scenario_default"
     local calendar_note=""
     case "$calendar_source" in
         none) calendar_note=" Календарь отключён (params.yaml: calendar_source: none): шаг про календарь (3a) пропусти, секцию «Календарь» в плане не пиши, календарный коннектор не запрашивай." ;;
@@ -882,6 +947,30 @@ ${prompt}"
     return $rc
 }
 
+# Publish only owner-generated status. The private temporary file is renamed
+# into place, so a killed writer never exposes a partial counter (#1067).
+publish_week_review_status() {
+    local status_file="$1" outcome="$2" rc="$3" failed_runs="$4" status_tmp
+    if [ -e "$status_file" ] || [ -L "$status_file" ]; then
+        if [ ! -f "$status_file" ] || [ -L "$status_file" ]; then
+            log "ERROR: week-review status changed type: $status_file"
+            return 77
+        fi
+    fi
+    status_tmp=$(umask 077; mktemp "$LOG_DIR/.week-review-last-status.XXXXXX") || {
+        log "ERROR: cannot create week-review status record"
+        return 77
+    }
+    if ! printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$outcome" "$rc" "$failed_runs" > "$status_tmp" ||
+        ! mv "$status_tmp" "$status_file" ||
+        [ ! -f "$status_file" ] || [ -L "$status_file" ]; then
+        rm -f "$status_tmp"
+        log "ERROR: cannot publish week-review status record"
+        return 77
+    fi
+}
+
 # issue #866: retry transient auth failures and leave a recoverable record.
 run_claude_with_retry() {
     local command_file="$1"
@@ -895,6 +984,53 @@ run_claude_with_retry() {
     local attempt=1
     local rc=0
     local status_file="$LOG_DIR/${command_file}-last-status"
+    local week_review_failed_runs=0
+    local stamped_at prior_outcome prior_rc prior_count extra
+
+    # The model's stdout is written to LOG_FILE. Count only outcomes published
+    # by this process, never RECORDED/GAVE UP text found in that shared log.
+    if [ "$command_file" = week-review ] && { [ -e "$status_file" ] || [ -L "$status_file" ]; }; then
+        if [ ! -f "$status_file" ] || [ -L "$status_file" ] ||
+            ! IFS=$'\t' read -r stamped_at prior_outcome prior_rc prior_count extra < "$status_file"; then
+            log "ERROR: week-review status is not a regular complete record: $status_file"
+            return 77
+        fi
+        if [ -n "$extra" ] || ! [[ "$stamped_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] ||
+            ! [[ "$prior_rc" =~ ^[0-9]+$ ]] ||
+            { [ "$prior_outcome" != SUCCESS ] && [ "$prior_outcome" != FAILED ] &&
+                [ "$prior_outcome" != UNKNOWN ]; }; then
+            log "ERROR: malformed week-review status: $status_file"
+            return 77
+        fi
+        case "$prior_outcome:$prior_count" in
+            SUCCESS:|SUCCESS:0|FAILED:|FAILED:1|FAILED:2|UNKNOWN:1|UNKNOWN:2) ;;
+            *) log "ERROR: invalid week-review outcome/count: $status_file"; return 77 ;;
+        esac
+        if [ "$prior_outcome" = UNKNOWN ] && [ "$prior_rc" != 77 ]; then
+            log "ERROR: invalid uncertain week-review status: $status_file"
+            return 77
+        fi
+        if [ "${stamped_at%% *}" = "$(date '+%Y-%m-%d')" ] &&
+            { [ "$prior_outcome" = FAILED ] || [ "$prior_outcome" = UNKNOWN ]; }; then
+            # The previous release did not record whether this was failure #1
+            # or #2. Treat today's three-field FAILED as exhausted: automatic
+            # replay might otherwise become a third model call after upgrade.
+            prior_count=${prior_count:-2}
+            week_review_failed_runs=$prior_count
+        fi
+    fi
+
+    if [ "$command_file" = week-review ]; then
+        # Reserve the attempt before invoking the model. UNKNOWN pauses every
+        # automatic replay if this shell dies or final status publication fails:
+        # the report may already have reached origin, even on attempt one.
+        # A manual retry is allowed and success resets the count to zero.
+        if [ "$week_review_failed_runs" -lt "$WEEK_REVIEW_MAX_FAILED_RUNS" ]; then
+            week_review_failed_runs=$((week_review_failed_runs + 1))
+        fi
+        publish_week_review_status "$status_file" UNKNOWN 77 "$week_review_failed_runs" || return 77
+        WEEK_REVIEW_FAILED_RUNS=$week_review_failed_runs
+    fi
 
     while [ "$attempt" -le "$max_attempts" ]; do
         rc=0
@@ -931,10 +1067,18 @@ run_claude_with_retry() {
 
     # Record the final outcome so the morning traffic light can distinguish a
     # fresh failure from a stale one.
-    if [ "$rc" -eq 0 ]; then
+    if [ "$command_file" = week-review ]; then
+        if [ "$rc" -eq 0 ]; then
+            publish_week_review_status "$status_file" SUCCESS 0 0 || return 77
+        else
+            publish_week_review_status "$status_file" FAILED "$rc" "$week_review_failed_runs" || return 77
+        fi
+    elif [ "$rc" -eq 0 ]; then
         printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "SUCCESS" "$rc" > "$status_file"
     else
         printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "FAILED" "$rc" > "$status_file"
+    fi
+    if [ "$rc" -ne 0 ]; then
         log "RECORDED: $command_file failed with rc=$rc (see $status_file)"
     fi
 
@@ -942,9 +1086,151 @@ run_claude_with_retry() {
 }
 
 # Проверка: уже запускался ли сценарий сегодня
+# Done for today = it succeeded, or it gave up for the day with "GAVE UP scenario: <name> (<reason>)"
+# (the morning Day Open below), so a launchd RunAtLoad/CalendarInterval rerun does not start it again.
+# week-review's own "GAVE UP scenario: week-review after ..." line does not match on purpose: after
+# that alarm the owner reruns week-review by hand the same day.
 already_ran_today() {
     local scenario="$1"
-    [ -f "$LOG_FILE" ] && grep -q "SUCCESS scenario: $scenario" "$LOG_FILE"
+    if [ "$scenario" = week-review ]; then
+        local status_file="$LOG_DIR/week-review-last-status"
+        local stamped_at outcome rc failed_runs extra
+        [ -f "$status_file" ] && [ ! -L "$status_file" ] || return 1
+        IFS=$'\t' read -r stamped_at outcome rc failed_runs extra < "$status_file" || return 1
+        [ -z "$extra" ] && [ "${stamped_at%% *}" = "$(date '+%Y-%m-%d')" ] &&
+            [ "$outcome" = SUCCESS ] && [ "$rc" = 0 ] &&
+            { [ -z "$failed_runs" ] || [ "$failed_runs" = 0 ]; }
+        return $?
+    fi
+    [ -f "$LOG_FILE" ] && grep -qF -e "SUCCESS scenario: $scenario" -e "GAVE UP scenario: $scenario (" "$LOG_FILE"
+}
+
+# D16 (#983, #981): the morning Day Open never falls back to the free-form day-plan prompt -- it
+# ignores priorities.yaml and the scaffold and invents the plan (an "unavailable" calendar,
+# mandatory items nobody configured, half the commits). A failed Day Open is logged with its reason
+# and alarmed by one delivered day-open-failed message a day; the plan is then built in a live
+# session. Structural failures end the day (GAVE UP + exit 0, the scheduler marks the day). A
+# deferral (exit 7) is no failure: no alarm, not an attempt, exit 7. Any other pipeline code is
+# passed out for the scheduler to retry. Attempts are counted when they START: the scheduler's
+# timeout kills this script before it could record an end. The explicit `strategist.sh day-plan`
+# below still runs the prompt by hand.
+DAY_OPEN_MAX_ATTEMPTS=3
+DAY_OPEN_ATTEMPT_MARK="RECORDED: day-open attempt"
+DAY_OPEN_DEFERRED_MARK="RECORDED: day-open deferred"
+DAY_OPEN_OK_MARK="Morning: Day Open pipeline OK"
+DAY_OPEN_ALARM_MARK="ALARM: day-open-failed"
+# What notify.sh prints into the same log once the Bot API accepted the message (send_telegram):
+# only a delivered alarm counts, a failed send is retried by the next attempt.
+DAY_OPEN_ALARM_SENT_MARK="Telegram notification sent: strategist/day-open-failed"
+# ...and what it prints when Telegram is not configured: there is nothing to deliver then, the reason
+# stays in this log. A send that fails on the transport (no network: curl exits non-zero under notify.sh's
+# `set -e`) prints nothing at all, so "owed" cannot be read from a failure line; it is "not delivered, and
+# not unconfigured".
+DAY_OPEN_ALARM_UNCONFIGURED_MARK="SKIP: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
+DAY_OPEN_ALARM_MAX_ATTEMPTS=3
+# Left in today's log by a give-up whose alarm is still owed: "<mark><reason code>|<exit code>|<reason text>".
+# The next run finishes that give-up from this record (day_open_resume_pending_give_up) and does not run the
+# pipeline again.
+DAY_OPEN_GIVEUP_PENDING_MARK="RECORDED: day-open give-up pending|"
+# A run that gave up on the plan while the alarm is still owed exits with this code, so the scheduler
+# comes back and the alarm goes out again; the day is not marked done meanwhile.
+DAY_OPEN_ALARM_RETRY_RC=74
+# The pipeline's own contract (day-open-pipeline.sh, steps 1 and 1.1/1.1b): 7 = deferred, not done
+# (yesterday is not closed yet, the triage report is still being published, the week is closing).
+DAY_OPEN_DEFERRED_RC=7
+# A saved scaffold is useful local work, but never a completed Day Open.
+DAY_OPEN_SCAFFOLD_RC=10
+# The scheduler reads exit 2 as "lock held, another run is in progress" (scheduler.sh
+# run_strategist_scenario); a pipeline that failed with 2 is passed out as this code instead.
+DAY_OPEN_RC2_SUBSTITUTE=73
+DAY_OPEN_ATTEMPT=0
+
+count_in_log() {  # <literal text> -> number of today's log lines that contain it, 0 without a log
+    local n
+    n=$(grep -cF -- "$1" "$LOG_FILE" 2>/dev/null || true)
+    echo "${n:-0}"
+}
+
+day_open_alarm() {  # <reason code> <reason text> [exit code]; at most one delivered message a day
+    if grep -qF "$DAY_OPEN_ALARM_SENT_MARK" "$LOG_FILE" 2>/dev/null; then
+        log "Day Open: тревога сегодня уже доставлена, повторно не шлю ($2)"
+        return 0
+    fi
+    # The limit is checked BEFORE a send starts: a run killed inside the send leaves its ALARM line (and a
+    # pending give-up) behind, and the next run must not start one more send past the limit (red team of the
+    # 0.41.1 candidate: killed runs kept the count from ever stopping the sends).
+    if [ "$(count_in_log "$DAY_OPEN_ALARM_MARK")" -ge "$DAY_OPEN_ALARM_MAX_ATTEMPTS" ]; then
+        log "Day Open: тревога уже начата $DAY_OPEN_ALARM_MAX_ATTEMPTS раза за сегодня, больше не шлю ($2)"
+        return 0
+    fi
+    log "$DAY_OPEN_ALARM_MARK ($2)"
+    # The template turns the code into the message text (roles/synchronizer/scripts/templates/strategist.sh).
+    DAY_OPEN_FAILED_REASON="$1" DAY_OPEN_FAILED_RC="${3:-}" notify_telegram "day-open-failed"
+}
+
+day_open_alarm_owed() {  # 0 = the alarm is not delivered, Telegram is configured and attempts are left
+    grep -qF "$DAY_OPEN_ALARM_SENT_MARK" "$LOG_FILE" 2>/dev/null && return 1
+    grep -qF "$DAY_OPEN_ALARM_UNCONFIGURED_MARK" "$LOG_FILE" 2>/dev/null && return 1
+    [ "$(count_in_log "$DAY_OPEN_ALARM_MARK")" -lt "$DAY_OPEN_ALARM_MAX_ATTEMPTS" ]
+}
+
+# No more morning runs today and no false SUCCESS -- once the alarm is out: a give-up with an owed alarm
+# leaves the day open (exit DAY_OPEN_ALARM_RETRY_RC, no GAVE UP line) and records what it gave up on, so
+# the next scheduler run sends the alarm again and nothing else: day_open_resume_pending_give_up reads the
+# record before the pipeline is looked at. That also bounds the sends: every one comes from a give-up or
+# from a transient failure of attempts 1 and 2, and the owed test stops at DAY_OPEN_ALARM_MAX_ATTEMPTS.
+day_open_give_up() {  # <reason code> <reason text> [exit code]
+    day_open_alarm "$@"
+    if day_open_alarm_owed; then
+        log "$DAY_OPEN_GIVEUP_PENDING_MARK$1|${3:-}|$2"
+        log "Day Open: тревога не доставлена, повтор доставки при следующем запуске планировщика без нового запуска конвейера, код $DAY_OPEN_ALARM_RETRY_RC ($2)"
+        exit "$DAY_OPEN_ALARM_RETRY_RC"
+    fi
+    log "GAVE UP scenario: day-plan ($2)"
+    exit 0
+}
+
+day_open_resume_pending_give_up() {  # finishes a give-up whose alarm is still owed; returns when there is none
+    local rec code rc
+    rec=$(grep -F "$DAY_OPEN_GIVEUP_PENDING_MARK" "$LOG_FILE" 2>/dev/null | tail -1) || true
+    [ -n "$rec" ] || return 0
+    rec=${rec#*"$DAY_OPEN_GIVEUP_PENDING_MARK"}
+    code=${rec%%|*}
+    rec=${rec#*|}
+    rc=${rec%%|*}
+    day_open_give_up "$code" "${rec#*|}" "$rc"
+}
+
+day_open_start_attempt() {  # gives up instead when DAY_OPEN_MAX_ATTEMPTS attempts already started today
+    local started
+    # A deferred run started an attempt too, but it is no failure and does not count.
+    started=$(( $(count_in_log "$DAY_OPEN_ATTEMPT_MARK") - $(count_in_log "$DAY_OPEN_DEFERRED_MARK") ))
+    # A plan built earlier today is no failure: a later run (RunAtLoad after a reboot) reaches the
+    # pipeline, whose own dedup answers "already committed".
+    if [ "$started" -ge "$DAY_OPEN_MAX_ATTEMPTS" ] && ! grep -qF "$DAY_OPEN_OK_MARK" "$LOG_FILE" 2>/dev/null; then
+        day_open_give_up attempts-exhausted "за сегодня начато попыток: $started, ни одна не собрала план (ошибка или прерывание по тайм-ауту)"
+    fi
+    DAY_OPEN_ATTEMPT=$((started + 1))
+    log "$DAY_OPEN_ATTEMPT_MARK $DAY_OPEN_ATTEMPT (предел $DAY_OPEN_MAX_ATTEMPTS за день, отсрочки не считаются)"
+}
+
+day_open_deferred() {  # the pipeline deferred the day (exit 7) and reported it itself; exits 7, the scheduler retries later
+    log "$DAY_OPEN_DEFERRED_MARK: конвейер отложил Открытие дня (код 7: вчерашний день ещё не закрыт, отчёт triage ещё готовится или закрывается неделя). Это не сбой: тревоги нет, попытка не засчитана, повтор при следующем запуске планировщика"
+    exit "$DAY_OPEN_DEFERRED_RC"
+}
+
+day_open_transient_failure() {  # <pipeline exit code>; exits with it (the scheduler retries) or gives up on the last attempt
+    local rc="$1" out_rc="$1" note=""
+    if [ "$DAY_OPEN_ATTEMPT" -ge "$DAY_OPEN_MAX_ATTEMPTS" ]; then
+        day_open_give_up attempts-exhausted "попытка $DAY_OPEN_ATTEMPT из $DAY_OPEN_MAX_ATTEMPTS тоже не удалась: конвейер завершился с кодом $rc" "$rc"
+    fi
+    day_open_alarm pipeline-failed "конвейер Открытия дня завершился с кодом $rc, попытка $DAY_OPEN_ATTEMPT из $DAY_OPEN_MAX_ATTEMPTS" "$rc"
+    if [ "$rc" -eq 2 ]; then
+        out_rc=$DAY_OPEN_RC2_SUBSTITUTE
+        note=" (код конвейера 2 передаю как $out_rc: планировщик читает 2 как «другой запуск ещё идёт»)"
+    fi
+    log "FAILED scenario: day-plan (rc=$rc) -- план дня не собран, выхожу с кодом $out_rc$note, повтор при следующем запуске планировщика"
+    exit "$out_rc"
 }
 
 # Note-Review canary (#961): number of NEW notes in fleeting-notes.md, i.e. bold titles that carry
@@ -963,28 +1249,156 @@ count_new_bold_notes() {  # <fleeting-notes.md>
     echo "${count:-0}"
 }
 
-# File-based lock to prevent concurrent execution (RunAtLoad + CalendarInterval race)
-# mkdir — атомарная операция на POSIX, исключает TOCTOU race condition
+# File-based lock to prevent concurrent execution (RunAtLoad + CalendarInterval race).
+# A complete owner record is published by one atomic hard link. A contender
+# never removes a live or unpublished lock: the old mkdir/pid protocol exposed
+# an empty pid file, then stale-lock reclaim deleted a live owner's directory
+# (#1030). The short acquisition gate serializes recovery of dead new owners.
 LOCK_DIR="$LOG_DIR/locks"
 mkdir -p "$LOCK_DIR"
 
+STRATEGIST_LOCK_OWNER=""
+STRATEGIST_LOCK_MAIN=""
+STRATEGIST_LOCK_LEGACY=""
+STRATEGIST_LOCK_GATE=""
+
+release_lock() {
+    local path
+    for path in "$STRATEGIST_LOCK_LEGACY" "$STRATEGIST_LOCK_MAIN"; do
+        if [ -n "$path" ] && [ -n "$STRATEGIST_LOCK_OWNER" ] && [ ! -L "$path" ] && [ "$path" -ef "$STRATEGIST_LOCK_OWNER" ]; then
+            rm -f -- "$path" || log "WARN: failed to release own lock: $path"
+        fi
+    done
+    if [ -n "$STRATEGIST_LOCK_OWNER" ]; then
+        rm -f -- "$STRATEGIST_LOCK_OWNER" || log "WARN: failed to remove lock owner record: $STRATEGIST_LOCK_OWNER"
+    fi
+    if [ -n "$STRATEGIST_LOCK_GATE" ]; then
+        rmdir "$STRATEGIST_LOCK_GATE" || log "WARN: failed to release lock acquisition gate: $STRATEGIST_LOCK_GATE"
+    fi
+}
+
+inspect_lock() {  # <scenario> <path>; under the acquisition gate
+    local scenario="$1" path="$2" owner_ref="$2" pid=""
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0
+    fi
+    if [ -L "$path" ]; then
+        log "ERROR: $scenario lock path is a symlink ($path); inspect it manually"
+        exit 1
+    elif [ -d "$path" ]; then
+        # A running pre-#1030 strategist uses this dated directory. Its pid
+        # may still be in the mkdir -> write window. Old contenders do not
+        # honor our acquisition gate, so never reclaim their directory.
+        owner_ref="$path/pid"
+    elif [ ! -f "$path" ]; then
+        log "ERROR: $scenario lock has an unexpected type ($path); inspect it manually"
+        exit 1
+    fi
+    pid=$(head -n 1 "$owner_ref" 2>/dev/null || true)
+    if [ -z "$pid" ] && [ -d "$path" ]; then
+        log "ERROR: $scenario legacy lock has no published owner ($path); check for an old running strategist before manual removal"
+        exit 1
+    fi
+    if ! [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        log "ERROR: $scenario lock has an unreadable owner ($path); inspect it manually"
+        exit 1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        log "SKIP: $scenario already running (PID $pid)"
+        exit 2
+    fi
+    if [ -d "$path" ]; then
+        log "ERROR: $scenario has a stale legacy lock ($path, PID $pid); verify the old owner is stopped, then remove that directory manually"
+        exit 1
+    fi
+    # Only new runners use this gate. The recorded owner is dead, so exactly
+    # one contender may remove this stale hard link before publishing its own.
+    rm -f -- "$path" || { log "ERROR: failed to remove stale lock for $scenario: $path"; exit 1; }
+    log "WARN: recovered stale lock for $scenario (PID $pid): $path"
+}
+
+publish_lock_link() {  # <complete-owner-record> <fixed-lock-path>
+    # Unlike `ln source target`, os.link never treats an existing directory
+    # (or a symlink to one) as a destination in which to create a third file.
+    # It fails with EEXIST instead. Python is already required by strategist.
+    python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+try:
+    os.link(sys.argv[1], sys.argv[2])
+except OSError:
+    sys.exit(1)
+PY
+}
+
+lock_conflict() {  # <scenario> <path>; publication failed while gate held
+    local scenario="$1" path="$2"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        inspect_lock "$scenario" "$path"
+        log "ERROR: lock path changed during publication for $scenario: $path"
+    else
+        log "ERROR: cannot publish lock for $scenario at $path (hard links unavailable or permission denied)"
+    fi
+    exit 1
+}
+
 acquire_lock() {
     local scenario="$1"
-    local lockdir="$LOCK_DIR/${scenario}.${DATE}.lck"
-    if ! mkdir "$lockdir" 2>/dev/null; then
-        local pid
-        pid=$(cat "$lockdir/pid" 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log "SKIP: $scenario already running (PID $pid)"
-            exit 2  # non-zero → scheduler won't mark_done
-        else
-            log "WARN: removing stale lock (PID $pid no longer exists): $lockdir"
-            rm -rf "$lockdir"
-            mkdir "$lockdir" || { log "ERROR: failed to acquire lock for $scenario"; exit 1; }
-        fi
+    local owner main="$LOCK_DIR/${scenario}.lock" legacy="$LOCK_DIR/${scenario}.${DATE}.lck"
+    local gate="$LOCK_DIR/.${scenario}.acquire" attempt gate_signal=""
+    if ! command -v python3 >/dev/null 2>&1; then
+        log "ERROR: python3 is required to publish a lock for $scenario"
+        exit 1
     fi
-    echo $$ > "$lockdir/pid" || { rm -rf "$lockdir"; log "ERROR: failed to write PID for $scenario"; exit 1; }
-    add_exit_cleanup "rm -rf \"$lockdir\" 2>/dev/null"
+    add_exit_cleanup 'release_lock'
+    # Bash can run a signal trap after mkdir returns but before the next
+    # assignment. Defer INT/TERM until the gate has a recorded owner; never
+    # let EXIT cleanup infer ownership from a path that another run may own.
+    trap 'gate_signal=130' INT
+    trap 'gate_signal=143' TERM
+    for ((attempt = 0; attempt < 250; attempt++)); do
+        if mkdir "$gate" 2>/dev/null; then
+            STRATEGIST_LOCK_GATE="$gate"
+            [ -z "$gate_signal" ] || exit "$gate_signal"
+            break
+        fi
+        [ -z "$gate_signal" ] || exit "$gate_signal"
+        sleep 0.02
+    done
+    [ -z "$gate_signal" ] || exit "$gate_signal"
+    if [ -z "$STRATEGIST_LOCK_GATE" ]; then
+        log "ERROR: acquisition gate unavailable for $scenario ($gate); inspect the gate before manual removal"
+        exit 1
+    fi
+    inspect_lock "$scenario" "$main"
+    inspect_lock "$scenario" "$legacy"
+    owner=$(mktemp "$LOCK_DIR/.${scenario}.owner.XXXXXX") || { log "ERROR: failed to create lock owner record for $scenario"; exit 1; }
+    STRATEGIST_LOCK_OWNER="$owner"
+    if ! printf '%s\n' "$$" > "$owner"; then
+        log "ERROR: failed to write lock owner record for $scenario"
+        exit 1
+    fi
+    if ! publish_lock_link "$owner" "$main"; then
+        lock_conflict "$scenario" "$main"
+    fi
+    STRATEGIST_LOCK_MAIN="$main"
+    # A dated link fences pre-#1030 strategist processes during an update.
+    # The undated link above keeps a run crossing midnight mutually exclusive.
+    if ! publish_lock_link "$owner" "$legacy"; then
+        lock_conflict "$scenario" "$legacy"
+    fi
+    STRATEGIST_LOCK_LEGACY="$legacy"
+    # Clear ownership before unlinking the shared path: after rmdir succeeds,
+    # another contender may create a new gate before our EXIT trap runs.
+    STRATEGIST_LOCK_GATE=""
+    if ! rmdir "$gate"; then
+        log "ERROR: failed to release acquisition gate for $scenario: $gate"
+        exit 1
+    fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ -z "$gate_signal" ] || exit "$gate_signal"
 }
 
 # issue #840: git-diff-feed and session-close-feed (extractor.sh) and this
@@ -1102,23 +1516,24 @@ case "$1" in
             log "SKIP: $SCENARIO already completed today"
             exit 0
         fi
+        day_open_resume_pending_give_up
 
         if [ "$DAY_OF_WEEK" -eq "$STRATEGY_DAY_NUM" ]; then
             log "Strategy day ($STRATEGY_DAY_NAME): running session prep"
-            run_claude "session-prep" "claude-sonnet-4-6"
+            run_claude "session-prep" ""
             notify_telegram "session-prep"
         else
             # Canonical Day Open pipeline: deterministic scaffold (reads priorities.yaml,
-            # enforces ТВС section order, runs server-news.sh for «Мир»). The free-form
-            # prompt is fallback ONLY — it ignores priorities.yaml and the scaffold, which
-            # was the root cause of the 2026-06-21 structure/priority drift.
+            # enforces ТВС section order, runs server-news.sh for «Мир»). It is the only
+            # morning path: a failure alarms instead of a free-form plan (D16, see
+            # day_open_give_up() above).
             log "Morning: running canonical Day Open pipeline"
             # $IWE_SCRIPTS first (matches the interactive day-open skill's own
             # resolution order), $WORKSPACE/scripts/ as legacy fallback for
             # installs that still deliver a workspace-root copy. #598: this
             # function used to read $WORKSPACE only, so $IWE_SCRIPTS-only
-            # installs fell back to free-form silently, every morning, with
-            # no escalation (found live: 37 consecutive days, 88 runs).
+            # installs fell back to the free-form prompt silently, every morning,
+            # with no escalation (found live: 37 consecutive days, 88 runs).
             DAY_OPEN_PIPELINE="${IWE_SCRIPTS:-}/day-open-pipeline.sh"
             if [ -z "${IWE_SCRIPTS:-}" ] || [ ! -f "$DAY_OPEN_PIPELINE" ]; then
                 DAY_OPEN_PIPELINE="$WORKSPACE/scripts/day-open-pipeline.sh"
@@ -1128,35 +1543,34 @@ case "$1" in
                 # delivered at all (Evgenii defects #2/#3, 18.08) — say so
                 # instead of a generic "unavailable/failed". The delivery
                 # graph itself is WP-529 F7 scope, no silent bridge here.
-                log "WARN: Day Open pipeline not found at \$IWE_SCRIPTS or $WORKSPACE/scripts — canonical pipeline is not delivered on this install (WP-529 F7); fallback to free-form day-plan prompt"
-                run_claude "day-plan" "claude-sonnet-4-6"
-                notify_telegram "day-plan"
-            elif bash "$DAY_OPEN_PIPELINE" >> "$LOG_FILE" 2>&1; then
-                log "Morning: Day Open pipeline OK (scaffold + llm-fill)"
-            else
-                pipeline_rc=$?
+                log "WARN: Day Open pipeline not found at \$IWE_SCRIPTS or $WORKSPACE/scripts — canonical pipeline is not delivered on this install (WP-529 F7)"
+                day_open_give_up not-delivered "конвейер Открытия дня не доставлен: day-open-pipeline.sh нет ни в \$IWE_SCRIPTS, ни в $WORKSPACE/scripts"
+            fi
+            day_open_start_attempt
+            pipeline_rc=0
+            DAY_OPEN_NOTIFICATION_OWNER=strategist bash "$DAY_OPEN_PIPELINE" >> "$LOG_FILE" 2>&1 || pipeline_rc=$?
+            if [ "$pipeline_rc" -eq 0 ]; then
+                log "$DAY_OPEN_OK_MARK (scaffold + llm-fill)"
+            elif [ "$pipeline_rc" -eq "$DAY_OPEN_DEFERRED_RC" ]; then
+                day_open_deferred
+            elif [ "$pipeline_rc" -eq 9 ]; then
                 # issue #893: exit 9 = no gateway configured (day-open-pipeline.sh
                 # §2), a case the pipeline itself already ships an answer for
-                # (--scaffold-only, issue #434) — retry with it instead of
-                # falling all the way to the free-form prompt, which ignores
-                # priorities.yaml and the scaffold (the #877 continuation:
-                # after #885 the message changed from HTTP 401 to "not
-                # configured", but strategist.sh still never used the escape
-                # hatch the pipeline's own error text already pointed at).
-                if [ "$pipeline_rc" -eq 9 ]; then
-                    log "Morning: Day Open pipeline has no gateway configured — retrying with --scaffold-only"
-                    if bash "$DAY_OPEN_PIPELINE" --scaffold-only >> "$LOG_FILE" 2>&1; then
-                        log "Morning: Day Open pipeline OK (scaffold only, no gateway)"
-                    else
-                        log "WARN: Day Open pipeline --scaffold-only also failed (see lines above in this log) — fallback to free-form day-plan prompt"
-                        run_claude "day-plan" "claude-sonnet-4-6"
-                        notify_telegram "day-plan"
-                    fi
+                # (--scaffold-only, issue #434). The retry's own code is kept
+                # right away: it is what the alarm reports.
+                log "Morning: Day Open pipeline has no gateway configured — retrying with --scaffold-only"
+                scaffold_rc=0
+                DAY_OPEN_NOTIFICATION_OWNER=strategist bash "$DAY_OPEN_PIPELINE" --scaffold-only >> "$LOG_FILE" 2>&1 || scaffold_rc=$?
+                if [ "$scaffold_rc" -eq "$DAY_OPEN_SCAFFOLD_RC" ]; then
+                    scaffold_path="${IWE_WORKSPACE:-$HOME/IWE}/.tmp/day-open-scaffold/DayPlan $(date +%Y-%m-%d).md"
+                    day_open_give_up scaffold-incomplete "шлюз модели не настроен; неполный каркас сохранён: $scaffold_path. День не открыт; правки черновика не переносятся автоматически в полный план" "$scaffold_rc"
+                elif [ "$scaffold_rc" -eq "$DAY_OPEN_DEFERRED_RC" ]; then
+                    day_open_deferred
                 else
-                    log "WARN: Day Open pipeline failed (see lines above in this log) — fallback to free-form day-plan prompt"
-                    run_claude "day-plan" "claude-sonnet-4-6"
-                    notify_telegram "day-plan"
+                    day_open_give_up scaffold-only-failed "шлюз модели не настроен (код 9), повтор с --scaffold-only тоже не прошёл: код $scaffold_rc (причина в строках выше)" "$scaffold_rc"
                 fi
+            else
+                day_open_transient_failure "$pipeline_rc"
             fi
         fi
         ;;
@@ -1186,24 +1600,33 @@ case "$1" in
         # WP-561 Ф25: `set -e` would end the script silently on a failed run (no message at
         # all); keep the code, alarm the pilot, then exit with it.
         week_review_rc=0
-        run_claude_with_retry "week-review" "claude-opus-4-7" 3 60 300 || week_review_rc=$?
-        # Fallback push for Knowledge Index (week-review creates a post there)
-        # KI_REPO may not exist for all users — guard with [ -d ]
-        KI_REPO="$HOME/IWE/DS-Knowledge-Index"
-        if [ -d "$KI_REPO/.git" ] && git -C "$KI_REPO" log --oneline -1 --since="1 hour ago" --grep="week-review" 2>/dev/null | grep -q .; then
-            git -C "$KI_REPO" push >> "$LOG_FILE" 2>&1 && log "Pushed Knowledge Index (fallback)" || log "WARN: KI push failed"
+        run_claude_with_retry "week-review" "" 3 60 300 || week_review_rc=$?
+        # Fallback push for Knowledge Index (week-review creates a post there).
+        # knowledge_repo in params.yaml is optional (see week-draft-init.sh) —
+        # if the pilot hasn't configured it, there is no repo to push to.
+        KI_PARAMS_FILE="${IWE_WORKSPACE:-$HOME/IWE}/params.yaml"
+        KI_REPO_REL=""
+        if [ -f "$KI_PARAMS_FILE" ]; then
+            KI_REPO_REL=$(grep -E "^knowledge_repo:" "$KI_PARAMS_FILE" | sed 's/^knowledge_repo:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || echo "")
+        fi
+        if [ -n "$KI_REPO_REL" ]; then
+            KI_REPO="${IWE_WORKSPACE:-$HOME/IWE}/${KI_REPO_REL}"
+            if [ -d "$KI_REPO/.git" ] && git -C "$KI_REPO" log --oneline -1 --since="1 hour ago" --grep="week-review" 2>/dev/null | grep -q .; then
+                git -C "$KI_REPO" push >> "$LOG_FILE" 2>&1 && log "Pushed Knowledge Index (fallback)" || log "WARN: KI push failed"
+            fi
         fi
         if [ "$week_review_rc" -ne 0 ]; then
             notify_telegram "week-review-failed" || true  # the alarm must never replace the run's own exit code
             # The scheduler reruns every non-zero exit at its next dispatch (about ten a day, 30
             # min of model time each). An undelivered report is usually structural (a refused
             # session, a frozen checkout), so after the second failed run today stop retrying:
-            # the alarms and the FAILED status already tell the owner (exit 0 makes the scheduler
-            # mark the week done, so a rerun after the fix is by hand). RECORDED is written once
-            # per dispatch, unlike FAILED, which repeats on every auth retry inside one.
-            if [ "$(grep -c 'RECORDED: week-review failed' "$LOG_FILE")" -ge "$WEEK_REVIEW_MAX_FAILED_RUNS" ]; then
-                log "GAVE UP scenario: week-review after $WEEK_REVIEW_MAX_FAILED_RUNS failed runs today; exit 0 marks the week done for the scheduler, so rerun it by hand once the cause is fixed"
-                exit 0
+            # the alarms and the FAILED status already tell the owner. Return a distinct failure
+            # so the scheduler suppresses further automatic runs today without marking weekly done.
+            # A manual run after the fix remains available. The persisted
+            # failed-run count excludes model stdout and internal auth retries.
+            if [ "${WEEK_REVIEW_FAILED_RUNS:-0}" -ge "$WEEK_REVIEW_MAX_FAILED_RUNS" ]; then
+                log "GAVE UP scenario: week-review after $WEEK_REVIEW_MAX_FAILED_RUNS failed runs today; automatic retries paused for today, manual retry remains available"
+                exit "$WEEK_REVIEW_EXHAUSTED_RC"
             fi
             exit "$week_review_rc"
         fi
@@ -1211,12 +1634,12 @@ case "$1" in
         ;;
     "session-prep")
         log "Manual: running session prep"
-        run_claude "session-prep" "claude-sonnet-4-6"
+        run_claude "session-prep" ""
         notify_telegram "session-prep"
         ;;
     "day-plan")
         log "Manual: running day plan"
-        run_claude "day-plan" "claude-sonnet-4-6"
+        run_claude "day-plan" ""
         notify_telegram "day-plan"
         ;;
     "note-review")
@@ -1238,13 +1661,13 @@ case "$1" in
         acquire_captures_write_lock || true
         if [ "$ISOLATED_RUN" = 1 ]; then
             note_review_rc=0
-            run_claude "note-review" "claude-haiku-4-5-20251001" || note_review_rc=$?
+            run_claude "note-review" "" || note_review_rc=$?
             if [ "$note_review_rc" -ne 0 ]; then
                 log "ISOLATION: сбой запуска модели (rc=$note_review_rc), публикации нет, копия сохранена: $ISO_WORKTREE"
                 exit "$note_review_rc"
             fi
         else
-            run_claude "note-review" "claude-haiku-4-5-20251001"
+            run_claude "note-review" ""
         fi
 
         # Canary: count bold notes after (needs to be visible for the alert further below)
@@ -1348,7 +1771,7 @@ case "$1" in
         ;;
     "day-close")
         log "Manual: running day close"
-        run_claude "day-close" "claude-sonnet-4-6"
+        run_claude "day-close" ""
         notify_telegram "day-close"
         ;;
     "strategy-session")

@@ -179,7 +179,7 @@ Respond in Russian unless the user writes in English.
 - **WP Entry Filter (S-47, БЛОКИРУЮЩЕЕ):** новый РП — только при явной связи с R1-R6 месяца или внешнем заказчике; иначе → `inbox/backlog-with-triggers.md`. Исключения: spin-off закрытого РП; прямое поручение пилота.
 - **Именование РП:** существительное-артефакт, только русский (Pack-ID допустим); реестр ≤80 символов → SYNC-CORE; переименование — синхронно REGISTRY+MEMORY.md+WeekPlan+DayPlan+WP-context.
 - **Память (S-35):** новые `memory/*.md` — обязательный frontmatter; шаблон и горизонты → `memory/memory-lifecycle-spec.md` (единственный источник).
-- **Security Audit Cadence (WP-212, S-36):** per-ArchGate (§Б B7.1 + STRIDE) · Week Close (`security-posture.md §3`) · Daily (tsekh-1) · Month Close (VR.R.002).
+- **Security Audit Cadence (WP-212, S-36):** per-ArchGate (§Б B7.1 + STRIDE) · Week Close (`security-posture.md §3`) · Daily (scheduled) · Month Close (VR.R.002).
 - **WeekPlan/WeekReport split (WP-297):** WeekPlan = только интенты, WeekReport = только факты; при создании WeekPlan итоги уезжают в WeekReport.
 - **Режим «на пальцах» (S-37):** триггеры «объясни», «на пальцах», «что сделали», «простыми словами» → Response Style + `memory/feedback_response_clarity_for_pilot.md`.
 - **Календарный конвейер (WP-357):** SoT — `DS-strategy/calendar/process-catalog.yaml` (+ derived `date-ledger.yaml`, не редактировать); новый процесс = каталог + plist; спецификация → `docs/calendar-pipeline.md`.

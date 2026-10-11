@@ -69,7 +69,7 @@ wp: WP-358
 
 ### Egress Adapter (локальный, `iwe-agent-dispatcher.py --mode session`, local-side)
 
-**Кто:** расширение `iwe-agent-dispatcher.py`, деплоится на машине пилота (или tsekh-1).
+**Кто:** расширение `iwe-agent-dispatcher.py`, деплоится на машине пилота (или на удалённом сервере).
 
 **Обязанности (на каждый новый ход):**
 1. Обнаружить новый ход в thread (launchd/systemd poll каждые 15с через `git pull`)
@@ -110,10 +110,10 @@ Egress передаёт Claude Code доступ к следующим инст�
 | Вариант | Где | Триггер | Ограничение |
 |---------|-----|---------|------------|
 | **Mac-local (MVP)** | Машина пилота | launchd plist | Требует включённый Mac + VS Code |
-| **tsekh-1 (пилот, Post-MVP)** | Linux-сервер пилота (всегда включён) | systemd unit | Headless `claude -p`, без Local Gateway |
+| **Удалённый сервер (пилот, Post-MVP)** | Linux-сервер пилота (всегда включён) | systemd unit | Headless `claude -p`, без Local Gateway |
 | **Per-machine (community)** | Машина пользователя | launchd/systemd | Инсталляция per-machine |
 
-Примечание: tsekh-1 лишается Local Gateway (открытые файлы, peer-координация) — только `claude -p`. Для пилота это компромисс для «в дороге без Mac». ArchGate при введении community-tier.
+Примечание: удалённый сервер лишается Local Gateway (открытые файлы, peer-координация) — только `claude -p`. Для пилота это компромисс для «в дороге без Mac». ArchGate при введении community-tier.
 
 ---
 
@@ -154,7 +154,7 @@ Egress передаёт Claude Code доступ к следующим инст�
 | Capability | выполняет task по шаблону | полный capability scope (calendar, WP, IWE) |
 | Failure mode | retry с exponential backoff | TG alert + graceful fail |
 | Trigger | cron/systemd | launchd/systemd poll 15с |
-| Deployment | headless, без VS Code | primary: VS Code; fallback: headless tsekh-1 |
+| Deployment | headless, без VS Code | primary: VS Code; fallback: headless на удалённом сервере |
 
 ---
 

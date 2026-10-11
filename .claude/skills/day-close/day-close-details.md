@@ -125,7 +125,7 @@ grep -nE "→ ждёт|ждёт|dep:|блокер|blocked:|остановлен|
 ## Шаг 4в: Index Health Check — алгоритм
 
 > Ловит раздутие индекс-файлов (MEMORY.md, WP-REGISTRY.md, MAPSTRATEGIC.md, *-registry.md, *-index.md, *-catalog.md).
-> Правило: [feedback_memory_index_discipline.md](../../../memory/feedback_memory_index_discipline.md)
+> Правило: индекс = только hook-строка + ссылка на source-of-truth, не дамп контента (см. алгоритм ниже).
 
 ```bash
 T="${IWE_TEMPLATE:-$HOME/IWE/FMT-exocortex-template}"
