@@ -93,8 +93,8 @@ KEYWORD_MAP = {
     "week close": ("week_close", "trivial", "WorkDone", "Итоги недели", "episteme"),
     "закрывай неделю": ("week_close", "trivial", "WorkDone", "Итоги недели", "episteme"),
     "month-close": ("month_close", "trivial", "WorkDone", "Итоги месяца", "episteme"),
-    "peer-сессия": ("peer_session", "trivial", None, "Отчёт пир-сессии", "unresolved"),  # SPECIAL_RESOLUTION: deferred-to-session; result_type тоже неизвестен до Decision Gate внутри сессии
-    "peer сессия": ("peer_session", "trivial", None, "Отчёт пир-сессии", "unresolved"),
+    "пир-сесси": ("peer_session", "trivial", None, "Отчёт пир-сессии", "unresolved"),  # stem matches «пир-сессия/-ии/-ию/-ией»; SPECIAL_RESOLUTION: deferred-to-session; result_type тоже неизвестен до Decision Gate внутри сессии
+    "пир сесси": ("peer_session", "trivial", None, "Отчёт пир-сессии", "unresolved"),
     # closed-loop
     "бот упал": ("bot_fix", "closed-loop", "WorkDone", "Бот", "system"),
     "ошибк бота": ("bot_fix", "closed-loop", "WorkDone", "Бот", "system"),     # matches «ошибка» and «ошибки»

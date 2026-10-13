@@ -77,6 +77,19 @@ iwe_sha256() {
   fi
 }
 
+# iwe_md5 — md5 of stdin, printed alone (no filename column). Same GNU-first
+# rationale as iwe_sha256 (issue #1108): md5sum is coreutils (every Linux,
+# absent on macOS by default); BSD `md5` with no file argument reads stdin
+# and already prints just the bare hex digest (verified: no "MD5(-)=" prefix
+# the way `md5 -p`/named-file invocations add one), so it needs no awk/cut.
+iwe_md5() {
+  if command -v md5sum >/dev/null 2>&1; then
+    md5sum | awk '{print $1}'
+  else
+    md5
+  fi
+}
+
 # iwe_file_mtime_date FILE — дата YYYY-MM-DD без смешивания stdout двух
 # несовместимых stat-реализаций. GNU и BSD ветки выбираются явно (#300).
 iwe_file_mtime_date() {
@@ -419,6 +432,59 @@ iwe_calendar_source() {
   esac
 }
 
+# iwe_heading_style [PARAMS_FILE] — DayPlan/WeekPlan section heading style
+# (issue #496): details (default) uses <details><summary> per formatting.md
+# (collapsible in GitHub/VS Code); markdown uses `## ` headings instead
+# (readable in viewers that render HTML literally, e.g. Obsidian — the PR's
+# original complaint). A missing key or file means details, so existing
+# installs keep working; an unknown value warns on stderr and also means
+# details.
+iwe_heading_style() {
+  local file="${1:-}" value
+  [ -f "$file" ] || { echo details; return 0; }
+  value=$(grep -E '^dayplan_weekplan_heading_style:' "$file" 2>/dev/null | head -1 \
+    | sed -E 's/^dayplan_weekplan_heading_style:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^["'"'"']//; s/["'"'"']$//')
+  case "$value" in
+    ''|details) echo details ;;
+    markdown) echo "$value" ;;
+    *)
+      # `${value}` not `$value` before the closing guillemet: bash's parameter-
+      # name scanner can swallow the first byte of a following multibyte UTF-8
+      # character as part of the variable name (found running this function
+      # under `set -u`: "value<replacement-char>: unbound variable" — the same
+      # unbraced pattern already exists in iwe_calendar_source above and is a
+      # pre-existing, separate latent bug there, not fixed here/out of scope).
+      echo "WARN: params.yaml: dayplan_weekplan_heading_style «${value}» неизвестно (details|markdown), использую details" >&2
+      echo details ;;
+  esac
+}
+
+# iwe_render_heading_style STYLE — filters stdin, converting DayPlan/WeekPlan
+# section headings between the two forms iwe_heading_style selects (issue
+# #496). `details` (the default) passes text through unchanged — the
+# validator (.claude/hooks/protocol-artifact-validate.sh Check 1) already
+# accepts both forms, so this is purely a rendering choice, not a format
+# migration. Only converts the two literal patterns producers actually emit:
+# `<summary><b>TEXT</b></summary>` and `<summary><strong>TEXT</strong></summary>`
+# (the latter used by the captures section) — `<details[ open]>`/`</details>`
+# lines are dropped in markdown mode since `## ` headings need no wrapper.
+iwe_render_heading_style() {
+  local style="${1:-details}"
+  if [ "$style" != markdown ]; then
+    cat
+    return 0
+  fi
+  # delimiter `|` (not `#`): the replacement text itself is a `## ` heading,
+  # which would terminate a `#`-delimited s/// before reaching the capture
+  # group (found running this function for the first time: `sed: bad flag in
+  # substitute command: '#'`).
+  sed -E \
+    -e '/^<details( open)?>[[:space:]]*$/d' \
+    -e '/^<\/details>[[:space:]]*$/d' \
+    -e 's|^<summary><b>(.*)</b></summary>[[:space:]]*$|## \1|' \
+    -e 's|^<summary><strong>(.*)</strong></summary>[[:space:]]*$|## \1|'
+}
+
 # iwe_scheduler_model KEY DEFAULT [PARAMS_FILE] — model alias for one
 # strategist background scenario (issue #1092), read from a flat params.yaml
 # key (e.g. scheduler_model_week_review). A missing key means DEFAULT, so
@@ -439,4 +505,45 @@ iwe_scheduler_model() {
     return 1
   fi
   printf '%s\n' "$value"
+}
+
+# iwe_timeout DURATION CMD [ARGS...] — portable `timeout`. Delegates to the
+# real timeout(1) when present (GNU coreutils on every Linux, Homebrew
+# coreutils on macOS); falls back to a perl polyfill when it's missing
+# (stock macOS with no Homebrew — issue #1006, re-found for a 4th call site
+# by #1108). Centralized here instead of a 4th inline copy-paste — three
+# scripts (roles/extractor/scripts/extractor.sh, scripts/active-wp-sweep.sh,
+# roles/strategist/scripts/strategist.sh) each still carry their own inline
+# copy of the #1006 fix predating this helper; left as-is (migrating them is
+# out of scope for #1108) but any new caller should use this instead of a
+# 5th copy. Same exit-code contract as GNU timeout: 124 on an actual
+# timeout, otherwise the child's own exit status (128+signal if the child
+# was killed by a signal, matching how the shell itself reports that case).
+iwe_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$@"
+    return $?
+  fi
+  local duration="$1"; shift
+  perl -e '
+      my $timeout = shift @ARGV;
+      my $timed_out = 0;
+      my $pid = fork();
+      if ($pid == 0) { exec @ARGV; die "exec failed: $!"; }
+      eval {
+          local $SIG{ALRM} = sub { $timed_out = 1; die "timeout\n"; };
+          alarm $timeout;
+          waitpid($pid, 0);
+          alarm 0;
+      };
+      if ($timed_out) {
+          kill "TERM", $pid;
+          select(undef, undef, undef, 0.5);
+          kill "KILL", $pid;
+          waitpid($pid, 0);
+          exit 124;
+      }
+      # A child ended by a signal reports 128+signal, like the shell does.
+      exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8));
+  ' "$duration" "$@"
 }

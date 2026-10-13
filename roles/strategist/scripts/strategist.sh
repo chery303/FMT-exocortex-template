@@ -95,6 +95,27 @@ if [ -f "$UPDATE_MARKER" ]; then
     exit 75
 fi
 
+# issue #1097: every delivery check below used to fetch/compare against the literal
+# "origin/main", so an install whose governance repo defaults to e.g. "master" failed
+# postcondition with rc=70 on every scheduled run even though delivery was fine. Resolved
+# once from the already-cloned repo's remote HEAD symref (no network call), "main" is only
+# the fallback when that symref is missing (fresh clone edge case).
+resolve_default_branch() {
+    # --short here would return "origin/master", not "master" (verified live,
+    # git 2.50.1): --short only drops the "refs/remotes/" prefix, not the
+    # remote name. Read the full ref and strip the known prefix ourselves.
+    # `|| true`: under `set -e` (top of this file) a failing pipe here --
+    # verified live with a shimmed sed that always exits 1 -- aborted the
+    # WHOLE script at load time, long before isolated_begin() ever ran, not
+    # just this one lookup (CI: "sed fails" scenario in
+    # setup/test-strategist-isolated-scenarios.sh, 1 regression caught
+    # post-merge). The fallback two lines below already covers empty output;
+    # this only stops that failure from propagating further.
+    git -C "$WORKSPACE" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's#^refs/remotes/origin/##' || true
+}
+GIT_DEFAULT_BRANCH="$(resolve_default_branch)"
+GIT_DEFAULT_BRANCH="${GIT_DEFAULT_BRANCH:-main}"
+
 # PROMPTS_DIR резолв: $IWE_TEMPLATE (Generated runtime) → $HOME/IWE/FMT-exocortex-template (default) → relative (legacy fallback)
 if [ -n "${IWE_TEMPLATE:-}" ] && [ -d "$IWE_TEMPLATE/roles/strategist/prompts" ]; then
     PROMPTS_DIR="$IWE_TEMPLATE/roles/strategist/prompts"
@@ -311,7 +332,7 @@ fetch_delivery_origin() {
     case "$pause" in ''|0?*|*[!0-9]*|?????*) pause=5 ;; esac
     while :; do
         rc=0
-        GIT_TERMINAL_PROMPT=0 timeout "$per_try" "${DELIVERY_GIT_BIN:-git}" -C "$WORKSPACE" fetch -q origin main >/dev/null 2>>"$LOG_FILE" || rc=$?
+        GIT_TERMINAL_PROMPT=0 timeout "$per_try" "${DELIVERY_GIT_BIN:-git}" -C "$WORKSPACE" fetch -q origin "$GIT_DEFAULT_BRANCH" >/dev/null 2>>"$LOG_FILE" || rc=$?
         [ "$rc" -eq 0 ] && return 0
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] GIT-FETCH: попытка $n из $attempts не удалась (код $rc)" >> "$LOG_FILE"
         [ "$n" -lt "$attempts" ] || return 1
@@ -320,41 +341,41 @@ fetch_delivery_origin() {
     done
 }
 
-delivery_baseline() {  # <scenario> -> origin/main sha before the run; empty = no contract or origin not freshly read
+delivery_baseline() {  # <scenario> -> origin/$GIT_DEFAULT_BRANCH sha before the run; empty = no contract or origin not freshly read
     [ -n "$(expected_delivery_path "$1")" ] || return 0
-    # A failed fetch must NOT fall back to the old local origin/main: a stale baseline would let
-    # an earlier report commit pass as this run's delivery.
+    # A failed fetch must NOT fall back to the old local origin/$GIT_DEFAULT_BRANCH: a stale
+    # baseline would let an earlier report commit pass as this run's delivery.
     fetch_delivery_origin || return 0
-    git -C "$WORKSPACE" rev-parse origin/main 2>/dev/null || true
+    git -C "$WORKSPACE" rev-parse "origin/$GIT_DEFAULT_BRANCH" 2>/dev/null || true
 }
 
-verify_delivery_postcondition() {  # <scenario> <origin/main sha before the run>; 0 = delivered or none required
+verify_delivery_postcondition() {  # <scenario> <origin/$GIT_DEFAULT_BRANCH sha before the run>; 0 = delivered or none required
     local scenario="$1" pre_origin="$2" spec post_origin existing
     spec=$(expected_delivery_path "$scenario")
     [ -n "$spec" ] || return 0
     if [ -z "$pre_origin" ]; then
-        log "POSTCONDITION scenario: $scenario -- origin/main перед запуском прочитать не удалось (нужны remote origin и ветка main, сеть), доставку проверить нельзя"
+        log "POSTCONDITION scenario: $scenario -- origin/$GIT_DEFAULT_BRANCH перед запуском прочитать не удалось (нужны remote origin и ветка по умолчанию, сеть), доставку проверить нельзя"
         return 1
     fi
     if ! fetch_delivery_origin; then
-        log "POSTCONDITION scenario: $scenario -- git fetch не удался (нужны remote origin и ветка main, сеть), доставку проверить нельзя"
+        log "POSTCONDITION scenario: $scenario -- git fetch не удался (нужны remote origin и ветка по умолчанию, сеть), доставку проверить нельзя"
         return 1
     fi
-    post_origin=$(git -C "$WORKSPACE" rev-parse origin/main 2>/dev/null) || post_origin=""
+    post_origin=$(git -C "$WORKSPACE" rev-parse "origin/$GIT_DEFAULT_BRANCH" 2>/dev/null) || post_origin=""
     if [ -z "$post_origin" ] || ! git -C "$WORKSPACE" merge-base --is-ancestor "$pre_origin" "$post_origin" 2>/dev/null; then
-        log "POSTCONDITION scenario: $scenario -- origin/main не продолжает состояние до запуска (${pre_origin:0:12} не предок ${post_origin:0:12}): расхождение или force-push"
+        log "POSTCONDITION scenario: $scenario -- origin/$GIT_DEFAULT_BRANCH не продолжает состояние до запуска (${pre_origin:0:12} не предок ${post_origin:0:12}): расхождение или force-push"
         return 1
     fi
     # ACMRT: a deletion of the report file is a change, not a delivery.
     if [ -z "$(git -C "$WORKSPACE" diff --name-only --diff-filter=ACMRT "$pre_origin" "$post_origin" -- ":(glob)$spec")" ]; then
-        log "POSTCONDITION scenario: $scenario -- за запуск на origin/main не появилось созданного или изменённого файла '$spec': отчёт не доставлен"
+        log "POSTCONDITION scenario: $scenario -- за запуск на origin/$GIT_DEFAULT_BRANCH не появилось созданного или изменённого файла '$spec': отчёт не доставлен"
         # The proof is per run, on purpose: a report that was already there is not this run's work
         # (an empty stub or last week's file would otherwise pass). A rerun after an earlier delivery
         # still fails here, so name what IS there -- the reader can tell a false alarm at a glance.
         # diff against the empty tree: the same pathspec semantics as the delivery check above
         # (ls-tree reads its paths differently and would miss the glob).
         existing=$(git -C "$WORKSPACE" diff --name-only "$(git -C "$WORKSPACE" hash-object -t tree /dev/null)" "$post_origin" -- ":(glob)$spec" 2>/dev/null | tr '\n' ';')
-        [ -z "$existing" ] || log "POSTCONDITION scenario: $scenario -- на origin/main уже есть, без изменений за этот запуск: ${existing%;}"
+        [ -z "$existing" ] || log "POSTCONDITION scenario: $scenario -- на origin/$GIT_DEFAULT_BRANCH уже есть, без изменений за этот запуск: ${existing%;}"
         return 1
     fi
     return 0
@@ -488,9 +509,9 @@ ISO_WORKSPACE=""
 ISO_BRANCH=""
 ISO_BASE_SHA=""
 # The copy is created from origin/$ISO_BASE_BRANCH and its result is published back to it: the copy's
-# own branch ($ISO_BRANCH) exists only locally. The value must match the branch fetch_delivery_origin
-# refreshes (main, fixed there); change them together.
-ISO_BASE_BRANCH="main"
+# own branch ($ISO_BRANCH) exists only locally. Shares $GIT_DEFAULT_BRANCH with
+# fetch_delivery_origin (issue #1097) so both always agree without being kept in sync by hand.
+ISO_BASE_BRANCH="$GIT_DEFAULT_BRANCH"
 
 isolation_enabled() {  # <scenario>; 0 = listed in STRATEGIST_ISOLATED_SCENARIOS
     local list=",${STRATEGIST_ISOLATED_SCENARIOS:-},"
@@ -538,7 +559,7 @@ isolated_begin() {  # <scenario>; 0 = ready, 1 = not started (canon untouched)
         return 1
     fi
     if ! fetch_delivery_origin; then
-        log "ISOLATION: git fetch origin main не удался, свежую копию взять нельзя, сценарий $scenario не запущен"
+        log "ISOLATION: git fetch origin $GIT_DEFAULT_BRANCH не удался, свежую копию взять нельзя, сценарий $scenario не запущен"
         return 1
     fi
     if ! git -C "$canon" rev-parse --verify -q "origin/$ISO_BASE_BRANCH^{commit}" >/dev/null 2>&1; then
@@ -905,7 +926,7 @@ ${prompt}"
         # WP-530 Ф72: nothing the model committed is published unverified; the runner checks the
         # allowlist and publishes from the copy (isolated_finish).
         log "Isolated run: публикацию делает isolated_finish после проверки списка путей"
-    elif git -C "$WORKSPACE" diff --quiet origin/main..HEAD 2>/dev/null; then
+    elif git -C "$WORKSPACE" diff --quiet "origin/$GIT_DEFAULT_BRANCH..HEAD" 2>/dev/null; then
         log "No unpushed commits"
     else
         # WP-7 Ф101: raw pull --rebase + push on a checkout shared with
@@ -1085,6 +1106,25 @@ run_claude_with_retry() {
     return $rc
 }
 
+# issue #1134: path for a manual "mark this scenario done for this week" record (see
+# the `mark-done` CLI command below). Keyed by ISO week (%G-W%V), not by date: a
+# week-review or session-prep done by hand on Sunday must still be recognized by
+# Monday's automatic run, which already_ran_today's own date-scoped checks below
+# cannot do on their own (week-review's status file compares to "today", and
+# session-prep's generic log-grep only searches today's rotated $LOG_FILE).
+_mark_done_file() {
+    local scenario="$1" week="$2"
+    printf '%s/mark-done-%s-%s' "$LOG_DIR" "$scenario" "$week"
+}
+
+# Did a human explicitly mark $1 done for the ISO week relevant to right now
+# (this week, not necessarily today)? A stale mark for a PAST week never
+# suppresses a future run — the file is week-specific, not scenario-wide.
+_marked_done_this_week() {
+    local scenario="$1"
+    [ -f "$(_mark_done_file "$scenario" "$(date +%G-W%V)")" ]
+}
+
 # Проверка: уже запускался ли сценарий сегодня
 # Done for today = it succeeded, or it gave up for the day with "GAVE UP scenario: <name> (<reason>)"
 # (the morning Day Open below), so a launchd RunAtLoad/CalendarInterval rerun does not start it again.
@@ -1092,6 +1132,9 @@ run_claude_with_retry() {
 # that alarm the owner reruns week-review by hand the same day.
 already_ran_today() {
     local scenario="$1"
+    if _marked_done_this_week "$scenario"; then
+        return 0
+    fi
     if [ "$scenario" = week-review ]; then
         local status_file="$LOG_DIR/week-review-last-status"
         local stamped_at outcome rc failed_runs extra
@@ -1117,6 +1160,10 @@ already_ran_today() {
 DAY_OPEN_MAX_ATTEMPTS=3
 DAY_OPEN_ATTEMPT_MARK="RECORDED: day-open attempt"
 DAY_OPEN_DEFERRED_MARK="RECORDED: day-open deferred"
+# What the pipeline's tg_notify logs once the Bot API accepted a deferral notice (day-open-pipeline.sh): a whole
+# line that STARTS with this text (a regex), not the text anywhere in a line, so that an alarm quoting it does not
+# count (red team, round 39). The retries of the day keep the "started" and "deferred" notices back only after it.
+DAY_OPEN_DEFERRAL_DELIVERED_LINE='^  \[tg delivered\] ⏸ '
 DAY_OPEN_OK_MARK="Morning: Day Open pipeline OK"
 DAY_OPEN_ALARM_MARK="ALARM: day-open-failed"
 # What notify.sh prints into the same log once the Bot API accepted the message (send_telegram):
@@ -1538,6 +1585,21 @@ case "$1" in
             if [ -z "${IWE_SCRIPTS:-}" ] || [ ! -f "$DAY_OPEN_PIPELINE" ]; then
                 DAY_OPEN_PIPELINE="$WORKSPACE/scripts/day-open-pipeline.sh"
             fi
+            # issue #1143: a launchd plist installed before IWE_SCRIPTS was
+            # added to its EnvironmentVariables (0.40.0) never gets refreshed
+            # for an auto:false role like the Synchronizer, so this run can
+            # still start without it. Neither path above found the pipeline —
+            # before declaring it not-delivered, try $IWE_TEMPLATE/scripts
+            # (already in that old plist's environment) as a last resort,
+            # same priority order as the two paths above (IWE_SCRIPTS still
+            # wins, then the workspace-root legacy copy, only then this).
+            if [ -z "${IWE_SCRIPTS:-}" ] && [ ! -f "$DAY_OPEN_PIPELINE" ] && [ -n "${IWE_TEMPLATE:-}" ]; then
+                FALLBACK_PIPELINE="$IWE_TEMPLATE/scripts/day-open-pipeline.sh"
+                if [ -f "$FALLBACK_PIPELINE" ]; then
+                    log "WARN: \$IWE_SCRIPTS not set and \$WORKSPACE/scripts/day-open-pipeline.sh missing — falling back to \$IWE_TEMPLATE/scripts (запущено из устаревшего plist, переустановите роль: bash \$IWE_TEMPLATE/roles/synchronizer/install.sh)"
+                    DAY_OPEN_PIPELINE="$FALLBACK_PIPELINE"
+                fi
+            fi
             if [ ! -f "$DAY_OPEN_PIPELINE" ]; then
                 # WP-529 F6: on user installs workspace-root scripts/ is not
                 # delivered at all (Evgenii defects #2/#3, 18.08) — say so
@@ -1547,8 +1609,19 @@ case "$1" in
                 day_open_give_up not-delivered "конвейер Открытия дня не доставлен: day-open-pipeline.sh нет ни в \$IWE_SCRIPTS, ни в $WORKSPACE/scripts"
             fi
             day_open_start_attempt
+            # A retry after a deferral that was ANNOUNCED today: the pipeline defers while yesterday is not closed and
+            # the scheduler comes back at every tick (up to seven a day: the launchd ticks of the synchronizer between 04:00
+            # and 21:59), so its "started" and "deferred" notices would go out again each time (red team of the 0.41.1
+            # candidate: up to 14 messages a day, 2 in v0.41.0). Once a
+            # deferral notice has been delivered (the pipeline logs "[tg delivered] ⏸ ..."), the retries keep those two
+            # notices back (day-open-pipeline.sh tg_notify); while it has not (no network, a refused send), they try
+            # again. The result and the pipeline's own alarms are not touched.
+            retry_quiet=""
+            if grep -q -- "$DAY_OPEN_DEFERRAL_DELIVERED_LINE" "$LOG_FILE" 2>/dev/null; then
+                retry_quiet=1
+            fi
             pipeline_rc=0
-            DAY_OPEN_NOTIFICATION_OWNER=strategist bash "$DAY_OPEN_PIPELINE" >> "$LOG_FILE" 2>&1 || pipeline_rc=$?
+            DAY_OPEN_NOTIFICATION_OWNER=strategist DAY_OPEN_QUIET_RETRY="$retry_quiet" bash "$DAY_OPEN_PIPELINE" >> "$LOG_FILE" 2>&1 || pipeline_rc=$?
             if [ "$pipeline_rc" -eq 0 ]; then
                 log "$DAY_OPEN_OK_MARK (scaffold + llm-fill)"
             elif [ "$pipeline_rc" -eq "$DAY_OPEN_DEFERRED_RC" ]; then
@@ -1560,7 +1633,7 @@ case "$1" in
                 # right away: it is what the alarm reports.
                 log "Morning: Day Open pipeline has no gateway configured — retrying with --scaffold-only"
                 scaffold_rc=0
-                DAY_OPEN_NOTIFICATION_OWNER=strategist bash "$DAY_OPEN_PIPELINE" --scaffold-only >> "$LOG_FILE" 2>&1 || scaffold_rc=$?
+                DAY_OPEN_NOTIFICATION_OWNER=strategist DAY_OPEN_QUIET_RETRY="$retry_quiet" bash "$DAY_OPEN_PIPELINE" --scaffold-only >> "$LOG_FILE" 2>&1 || scaffold_rc=$?
                 if [ "$scaffold_rc" -eq "$DAY_OPEN_SCAFFOLD_RC" ]; then
                     scaffold_path="${IWE_WORKSPACE:-$HOME/IWE}/.tmp/day-open-scaffold/DayPlan $(date +%Y-%m-%d).md"
                     day_open_give_up scaffold-incomplete "шлюз модели не настроен; неполный каркас сохранён: $scaffold_path. День не открыт; правки черновика не переносятся автоматически в полный план" "$scaffold_rc"
@@ -1641,6 +1714,48 @@ case "$1" in
         log "Manual: running day plan"
         run_claude "day-plan" ""
         notify_telegram "day-plan"
+        ;;
+    "mark-done")
+        # issue #1134: for a scenario closed by hand outside its own schedule
+        # (e.g. week-close run Sunday evening instead of waiting for Monday's
+        # automatic week-review) — record it so the next automatic run finds
+        # already_ran_today() already satisfied, instead of running a second
+        # time or overwriting what the owner just did.
+        mark_scenario="${2:-}"
+        case "$mark_scenario" in
+            week-review|session-prep) ;;
+            *)
+                echo "mark-done: сценарий должен быть week-review или session-prep, получено: '$mark_scenario'" >&2
+                exit 1
+                ;;
+        esac
+        mark_week=""
+        mark_clear=0
+        shift 2 2>/dev/null || shift $#
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --week) mark_week="${2:-}"; shift 2 ;;
+                --clear) mark_clear=1; shift ;;
+                *) echo "mark-done: неизвестный флаг: $1" >&2; exit 1 ;;
+            esac
+        done
+        case "$mark_week" in
+            "") mark_week="$(date +%G-W%V)" ;;
+            [0-9][0-9][0-9][0-9]-W[0-9][0-9]) ;;
+            *)
+                echo "mark-done: --week должен быть в формате YYYY-Www (например 2026-W41), получено: '$mark_week'" >&2
+                exit 1
+                ;;
+        esac
+        mark_file="$(_mark_done_file "$mark_scenario" "$mark_week")"
+        if [ "$mark_clear" -eq 1 ]; then
+            rm -f "$mark_file"
+            echo "mark-done: отметка снята: $mark_scenario за $mark_week"
+        else
+            mkdir -p "$LOG_DIR"
+            printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$mark_file"
+            echo "mark-done: отмечено сделанным: $mark_scenario за $mark_week"
+        fi
         ;;
     "note-review")
         acquire_lock "note-review"

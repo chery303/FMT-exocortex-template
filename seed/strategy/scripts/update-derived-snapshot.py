@@ -40,9 +40,15 @@ def _installed_governance_root() -> Optional[pathlib.Path]:
 
 def _resolve_snapshot_path() -> pathlib.Path:
     """Resolve cache location, preferring an installed copy's physical repo."""
+    # issue #1132: this cache used to live under inbox/WP-425/ — the platform
+    # author's own RP number, with no meaning for anyone else's governance
+    # repo. A fresh install got an unexplained inbox/WP-425/ folder, visible
+    # and untracked in `git status`, indistinguishable by look from a real
+    # work-product folder. `.cache/` carries no RP numbering, so it can never
+    # collide with one.
     installed_root = _installed_governance_root()
     if installed_root is not None:
-        return installed_root / "inbox/WP-425/cache/derived_snapshot.json"
+        return installed_root / ".cache/derived_snapshot.json"
 
     configured_root = os.environ.get("IWE_ROOT") or os.environ.get("IWE_WORKSPACE")
     iwe_root = (
@@ -51,10 +57,31 @@ def _resolve_snapshot_path() -> pathlib.Path:
         else pathlib.Path.home() / "IWE"
     )
     governance_repo = os.environ.get("IWE_GOVERNANCE_REPO", "DS-strategy")
-    return iwe_root / governance_repo / "inbox/WP-425/cache/derived_snapshot.json"
+    return iwe_root / governance_repo / ".cache/derived_snapshot.json"
 
 
 SNAPSHOT_PATH = _resolve_snapshot_path()
+
+
+def _migrate_stray_old_snapshot() -> None:
+    """One-time cleanup for installs caught by #1132 before its fix landed
+    (issue #1171). The old cache path, inbox/WP-425/derived_snapshot.json,
+    kept getting recreated nightly and is never removed by the #1132 fix
+    itself, which only changed the path for new writes. Removes exactly that
+    one file -- never the inbox/WP-425/ directory, in case a real WP-425
+    work-product folder happens to live there under the same RP number.
+    """
+    root = SNAPSHOT_PATH.parent.parent
+    old_path = root / "inbox" / "WP-425" / "derived_snapshot.json"
+    if not old_path.exists():
+        return
+    if not SNAPSHOT_PATH.exists() or old_path.stat().st_mtime > SNAPSHOT_PATH.stat().st_mtime:
+        SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        old_path.replace(SNAPSHOT_PATH)
+        logging.info("Migrated stray snapshot from %s to %s", old_path, SNAPSHOT_PATH)
+    else:
+        old_path.unlink()
+        logging.info("Removed stray old snapshot at %s (current copy is newer)", old_path)
 
 # Maps stage_id strings from 3_4_qualification to integer stage levels.
 # Source: render-pilot-guides.py _STAGE_ID_TO_INT (OwnerIntegrity: single mapping table).
@@ -235,6 +262,9 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(levelname)s %(message)s")
+
+    if not args.dry_run:
+        _migrate_stray_old_snapshot()
 
     if args.if_stale_days > 0 and not _is_stale(args.if_stale_days):
         logging.info("Snapshot is fresh (< %d days old) — skipping update", args.if_stale_days)

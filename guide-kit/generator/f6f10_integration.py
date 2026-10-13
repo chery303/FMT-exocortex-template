@@ -7,48 +7,40 @@ Integration layer for Ф6-Ф10 (applied topics, health adaptation).
 """
 
 import os
+import sys
 import json
 import logging
 from typing import Optional, Dict, Any, Tuple
 
+# structurer/ не является пакетом; добавляем путь для библиотечного вызова
+_STRUCTURER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "structurer")
+if _STRUCTURER_DIR not in sys.path:
+    sys.path.insert(0, _STRUCTURER_DIR)
+
 from scenario_router import route_and_serialize
 from health_adapter import adapt_profile_with_health
+from topic_ingest import ingest_topic_yaml
+from health_ingest import ingest_health_status
 
 logger = logging.getLogger(__name__)
 
 
 def load_topic_yaml(base_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Загружает topic.yaml если он есть в базовой директории.
+    Загружает topic.yaml через библиотечный приёмник Разметчика.
 
     Args:
         base_path: путь к директории (где лежит profile.yaml и topic.yaml)
 
     Returns:
-        Загруженный topic.yaml или None
+        Загруженный и валидированный topic.yaml или None
     """
-    if not base_path:
-        return None
-
-    topic_path = os.path.join(base_path, "topic.yaml")
-    if not os.path.isfile(topic_path):
-        return None
-
-    try:
-        import yaml
-        with open(topic_path, encoding="utf-8") as fh:
-            topic = yaml.safe_load(fh) or {}
-            logger.info("Loaded topic.yaml: scenario=%s, mode=%s",
-                       topic.get("scenario"), topic.get("mode"))
-            return topic
-    except Exception as e:
-        logger.warning("Failed to load topic.yaml: %s", e)
-        return None
+    return ingest_topic_yaml(base_path or "")
 
 
 def load_health_status(base_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Загружает health_status.json если он есть (из WP-470).
+    Загружает health_status.json через библиотечный приёмник Разметчика.
 
     Args:
         base_path: путь к директории
@@ -56,23 +48,26 @@ def load_health_status(base_path: Optional[str] = None) -> Optional[Dict[str, An
     Returns:
         Загруженный health_status.json или None
     """
-    if not base_path:
-        return None
+    return ingest_health_status(base_path or "")
 
-    health_path = os.path.join(base_path, "health_status.json")
-    if not os.path.isfile(health_path):
-        return None
 
-    try:
-        with open(health_path, encoding="utf-8") as fh:
-            health = json.load(fh)
-            logger.info("Loaded health_status.json: sleep=%.1fh, stress=%s",
-                       health.get("sleep", {}).get("total_hours", 0),
-                       health.get("cardiovascular", {}).get("stress_indicator", False))
-            return health
-    except Exception as e:
-        logger.warning("Failed to load health_status.json: %s", e)
-        return None
+def _sanitize_applied_topic_for_llm(applied_topic: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Оставляет в applied_topic только безопасные для передачи внешнему LLM поля.
+
+    Убирает source_url, source_location, learning_objectives, source_anchor —
+    они могут содержать PII или чувствительные ссылки. Оставляет метаданные
+    (scenario, mode, topic_name) и статистику (sections_count), достаточные
+    для текстового упоминания прикладной темы без деталей содержания.
+    """
+    result = applied_topic.get("result", {})
+    sections = result.get("sections", []) if isinstance(result, dict) else []
+    return {
+        "scenario": applied_topic.get("scenario"),
+        "mode": applied_topic.get("mode"),
+        "topic_name": applied_topic.get("topic_name"),
+        "sections_count": len(sections),
+    }
 
 
 def apply_applied_topics(planner_result: Dict[str, Any], topic_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -186,4 +181,10 @@ __all__ = [
     "apply_applied_topics",
     "apply_health_adaptation",
     "integrate_f6f10_into_generation",
+    "sanitize_applied_topic_for_llm",
 ]
+
+
+def sanitize_applied_topic_for_llm(applied_topic: Dict[str, Any]) -> Dict[str, Any]:
+    """Публичная обёртка для _sanitize_applied_topic_for_llm."""
+    return _sanitize_applied_topic_for_llm(applied_topic)

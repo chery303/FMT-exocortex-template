@@ -1,6 +1,12 @@
 """Smoke tests для Ф6-Ф10: все модули импортируются и работают."""
 
+import os
+import sys
+
 import pytest
+
+# generator/ не является пакетом; добавляем путь для импорта adapter как плоского модуля
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "generator"))
 
 
 class TestF6Decomposer:
@@ -260,6 +266,154 @@ class TestF6F10Integration:
         adapted = apply_health_adaptation(profile, health)
         assert "_health_adaptation" in adapted
         assert adapted["_health_adaptation"]["intensity_level"] == "low"
+
+
+class TestAdapterIntegration:
+    """Интеграция Ф6-Ф10 в adapter.generate_daily_plan."""
+
+    def test_generate_daily_plan_with_topic_yaml(self, tmp_path):
+        """topic.yaml рядом с profile.yaml → applied_topic попадает в llm_input."""
+        from unittest.mock import patch
+
+        from adapter import generate_daily_plan
+        from llm_backends import GenerationResult
+
+        # Подготовка временной базы пользователя
+        base = tmp_path / "user_base"
+        base.mkdir()
+
+        profile_path = base / "profile.yaml"
+        profile_path.write_text(
+            "rcs:\n  W: 0.5\n  source: manual\n",
+            encoding="utf-8",
+        )
+
+        topic_path = base / "topic.yaml"
+        topic_path.write_text(
+            "scenario: learn\n"
+            "mode: B\n"
+            "topic_name: Test Topic\n"
+            "source_url: http://example.com\n"
+            "source_type: book\n"
+            "sections:\n"
+            "  - id: s1\n"
+            "    title: Ch1\n"
+            "    source_location: Ch1\n"
+            "    learning_objectives: []\n"
+            "    estimated_hours: 1\n",
+            encoding="utf-8",
+        )
+
+        captured = {}
+
+        def fake_llm_generate(prompt_spec, gen_context):
+            captured["user_json"] = prompt_spec.user_json
+            return GenerationResult(
+                text='{"narrative": "текст", "plan_day": [{"label": "задание", "tomatoes": 1}]}',
+                backend_id="fake",
+                model="fake",
+            )
+
+        with patch("adapter.llm_generate", side_effect=fake_llm_generate):
+            result = generate_daily_plan(str(profile_path))
+
+        assert result.ok is True
+        # По умолчанию applied_topic НЕ передаётся в LLM (zero-upload)
+        assert "applied_topic" not in captured["user_json"]
+
+    def test_generate_daily_plan_with_topic_yaml_and_llm_flag(self, tmp_path):
+        """topic.yaml + include_applied_topic_in_llm=on → санитизированный applied_topic в llm_input."""
+        from unittest.mock import patch
+
+        from adapter import generate_daily_plan
+        from llm_backends import GenerationResult
+
+        base = tmp_path / "user_base"
+        base.mkdir()
+
+        profile_path = base / "profile.yaml"
+        profile_path.write_text(
+            "rcs:\n  W: 0.5\n  source: manual\n",
+            encoding="utf-8",
+        )
+
+        topic_path = base / "topic.yaml"
+        topic_path.write_text(
+            "scenario: learn\n"
+            "mode: B\n"
+            "topic_name: Test Topic\n"
+            "source_url: http://example.com\n"
+            "source_type: book\n"
+            "sections:\n"
+            "  - id: s1\n"
+            "    title: Ch1\n"
+            "    source_location: Ch1\n"
+            "    learning_objectives: []\n"
+            "    estimated_hours: 1\n",
+            encoding="utf-8",
+        )
+
+        config_path = base / "guide-kit.config.yaml"
+        config_path.write_text(
+            "include_applied_topic_in_llm: on\n",
+            encoding="utf-8",
+        )
+
+        captured = {}
+
+        def fake_llm_generate(prompt_spec, gen_context):
+            captured["user_json"] = prompt_spec.user_json
+            return GenerationResult(
+                text='{"narrative": "текст", "plan_day": [{"label": "задание", "tomatoes": 1}]}',
+                backend_id="fake",
+                model="fake",
+            )
+
+        with patch("adapter.llm_generate", side_effect=fake_llm_generate):
+            result = generate_daily_plan(str(profile_path), config_path=str(config_path))
+
+        assert result.ok is True
+        assert "applied_topic" in captured["user_json"]
+        # Санитизированная версия: только безопасные поля
+        assert captured["user_json"]["applied_topic"]["topic_name"] == "Test Topic"
+        assert captured["user_json"]["applied_topic"]["scenario"] == "learn"
+        assert captured["user_json"]["applied_topic"]["mode"] == "B"
+        assert captured["user_json"]["applied_topic"]["sections_count"] == 1
+        # Чувствительные поля отсутствуют
+        assert "source_url" not in captured["user_json"]["applied_topic"]
+        assert "sections" not in captured["user_json"]["applied_topic"]
+
+    def test_generate_daily_plan_without_topic_yaml(self, tmp_path):
+        """Без topic.yaml → applied_topic отсутствует (дефолтный путь)."""
+        from unittest.mock import patch
+
+        from adapter import generate_daily_plan
+        from llm_backends import GenerationResult
+
+        base = tmp_path / "user_base"
+        base.mkdir()
+
+        profile_path = base / "profile.yaml"
+        profile_path.write_text(
+            "rcs:\n  W: 0.5\n  source: manual\n",
+            encoding="utf-8",
+        )
+
+        captured = {}
+
+        def fake_llm_generate(prompt_spec, gen_context):
+            captured["user_json"] = prompt_spec.user_json
+            return GenerationResult(
+                text='{"narrative": "текст", "plan_day": [{"label": "задание", "tomatoes": 1}]}',
+                backend_id="fake",
+                model="fake",
+            )
+
+        with patch("adapter.llm_generate", side_effect=fake_llm_generate):
+            result = generate_daily_plan(str(profile_path))
+
+        assert result.ok is True
+        assert "applied_topic" not in captured["user_json"]
 
 
 if __name__ == "__main__":

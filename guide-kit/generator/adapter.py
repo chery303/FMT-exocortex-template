@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,6 +41,7 @@ from planner import plan_horizon
 from platform_knowledge import _DEFAULT_PLATFORM_URL, fetch_card_content as fetch_platform_card
 from work_section import render_work_section
 from llm_backends import GenerationContext, PromptSpec, generate as llm_generate
+from f6f10_integration import apply_applied_topics, load_topic_yaml, sanitize_applied_topic_for_llm
 
 logger = logging.getLogger(__name__)
 
@@ -476,6 +478,23 @@ def render_markdown(
 # Orchestration
 # ---------------------------------------------------------------------------
 
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```\s*$", re.DOTALL)
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip a single leading/trailing markdown code fence, if present.
+
+    The system prompt (prompt.md) explicitly forbids fences, but models
+    wrap JSON in ```json ... ``` anyway often enough that a live run hit
+    it on the first try (found 2026-08-12, mocked tests never exercise
+    real model output). Only strips a fence that wraps the *entire*
+    response — leaves unrelated text alone so json.loads still reports
+    a real parse failure for actually malformed output.
+    """
+    match = _JSON_FENCE_RE.match(text.strip())
+    return match.group(1) if match else text
+
+
 @dataclass
 class GuideResult:
     ok: bool
@@ -512,6 +531,12 @@ def generate_daily_plan(
     ctx = build_horizon_context(profile)
     planner_result = plan_horizon(ctx, seed=seed)
 
+    # Ф6-Ф8: прикладная тема из topic.yaml (приёмник Разметчика, не прямой доступ)
+    base_path = config.get("base_path") or os.path.dirname(os.path.abspath(profile_path))
+    topic_data = load_topic_yaml(base_path)
+    if topic_data:
+        planner_result = apply_applied_topics(planner_result, topic_data)
+
     element_id = planner_result["plan_skeleton"]["element_id"]
     platform_knowledge_on = str(config.get("platform_knowledge", "off")).lower() == "on"
     card_content = load_card_content(
@@ -521,6 +546,19 @@ def generate_daily_plan(
         platform_url=config.get("platform_knowledge_url"),
     )
     llm_input = dict(planner_result)
+
+    # applied_topic содержит данные пользовательского источника (URL, заголовки,
+    # learning_objectives) и не передаётся внешнему LLM по умолчанию (zero-upload,
+    # независимая проверка 12.08). Включение — только через явный конфиг-флаг
+    # include_applied_topic_in_llm, и даже тогда — в санитизированном виде.
+    include_applied = config.get("include_applied_topic_in_llm") in (True, "on", "true", "yes")
+    if "applied_topic" in planner_result:
+        if include_applied:
+            llm_input["applied_topic"] = sanitize_applied_topic_for_llm(planner_result["applied_topic"])
+        else:
+            llm_input.pop("applied_topic", None)
+            logger.info("applied_topic present but excluded from llm_input (include_applied_topic_in_llm=off)")
+
     if card_content:
         llm_input["card_content"] = card_content
 
@@ -566,7 +604,7 @@ def generate_daily_plan(
         )
 
     try:
-        llm_output = json.loads(llm_result.text)
+        llm_output = json.loads(_strip_json_fences(llm_result.text))
     except json.JSONDecodeError as e:
         logger.error("LLM output is not valid JSON: %s", e)
         return GuideResult(

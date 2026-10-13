@@ -94,6 +94,7 @@ FILES_EXCLUDE_EXACT=(
     "PRIVACY.md"
     "CODEOWNERS"
     "CITATION.cff"
+    ".gitattributes"
     "params.yaml"
     "params.yaml.example"
     "extensions/day-close.after.md"
@@ -171,6 +172,10 @@ PLATFORM_HOOKS_EXPLICIT_INCLUDE=(
     "seed/strategy/scripts/lib/notification-render.sh"
     "seed/strategy/scripts/lib/telegram.sh"
     "seed/strategy/scripts/lib/wp_inbox.py"
+    # issue #1102: extractor.sh looks for scripts/lib/publish-gate.sh since
+    # WP-5 F48, but it never shipped -- every install silently fell back to
+    # a raw `git push` with no retry on a stale origin/main.
+    "seed/strategy/scripts/lib/publish-gate.sh"
 )
 # #533: unlike ordinary seed content, these are platform-owned delivery and
 # upgrade infrastructure.  Keep each path explicit so the blanket seed/
@@ -266,6 +271,14 @@ SCRIPT_CONTRACT_EXPLICIT_INCLUDE=(
     # runs in CI via run-issue-tests.sh, must ship with the template like its
     # bash sibling above.
     "scripts/tests/test_issue_557_zsh_special_vars.sh"
+    # РП-7 Ф216 (11.10): фаза-1 гейт issue #1114 (cp1251) и регрессии #1147
+    # доставляются, как вся семья test_issue_*; baseline — обязательный
+    # ratchet-файл доставляемого check-python-encoding.py (та же причина, что
+    # python-resolver-baseline.txt выше: без него гейт на установке падает).
+    "scripts/tests/cp1251-smoke.sh"
+    "scripts/tests/python-encoding-baseline.txt"
+    "scripts/tests/test_issue_1114_encoding_gate.sh"
+    "scripts/tests/test_issue_1147_memory_migrate.sh"
 )
 
 is_explicit_include() {

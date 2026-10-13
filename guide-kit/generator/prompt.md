@@ -379,6 +379,12 @@ Return **only** the following JSON, no markdown fences, no text before or after.
       "note": "мини-секция дополняет мыслительный урок, не заменяет и не продвигает программу автоматически"
     }
   },
+  "applied_topic": {
+    "scenario": "learn",
+    "mode": "B",
+    "topic_name": "Python Design Patterns",
+    "sections_count": 2
+  },
   "horizon_context": {
     "quarter": { "bottleneck_slot": "M2", "theme": "Выстроить IWE", "target_delta": {"M2": 2} },
     "month":   { "memes": [], "methods": [], "label": "Тема: Инвестирование времени" },
@@ -442,6 +448,16 @@ When present, `applied_section` carries `{domain, characteristic, link_mode, wor
 
 Append this as a **new top-level narrative field** `applied_note` (2-4 sentences, Russian, same informal "ты" address as `narrative`) — never merged into `narrative` itself, so the delivery layer can place it as a distinct mini-section per the WP-495 Ф3 model ("дополняет мыслительный урок, не заменяет и не продвигает программу автоматически" — carry that spirit: this is a side practice, not a second bottleneck to solve today).
 
+**H3.6 Applied-topic mini-section, if top-level `applied_topic` is present (WP-483 Ф6)**
+
+> `applied_topic` is a SEPARATE field from `plan_skeleton.applied_section` (H3.5) — different origin (user-supplied source material vs a platform-chosen domain trait) and different JSON location (top-level, next to `plan_skeleton`, not nested inside it).
+
+When `applied_topic` is present AND `applied_topic.sections_count > 0` (a non-zero count means the Decomposer actually parsed the user's source): this REPLACES H3.5 for today — do not also emit an `applied_section`-based note. Write `applied_note` (2-4 sentences, same style and address as H3.5) naming `applied_topic.topic_name` and framing that a section of it is part of today's practice, per `applied_topic.scenario`/`applied_topic.mode`.
+
+When `applied_topic` is present but `applied_topic.sections_count == 0` (the Decomposer degraded honestly — the source was unreadable or empty): treat `applied_topic` as absent for this step and fall through to H3.5's own condition (`plan_skeleton.applied_section`) as if it never arrived. Never invent applied-topic content from an empty result — an empty `applied_topic` must not leave the day without a mini-section if `applied_section` is available to fill it.
+
+If neither `applied_topic` (with `sections_count > 0`) nor `plan_skeleton.applied_section` is present, `applied_note` stays null — same as H3.5 already specifies.
+
 **H4. Tone and length by trigger**
 
 | trigger | Tone | Narrative length |
@@ -482,7 +498,7 @@ Append this as a **new top-level narrative field** `applied_note` (2-4 sentences
 2. `narrative` — 2-3 paragraphs, separated by `\n\n`; Russian language; informal "ты" address
 3. `label` — ≤60 characters; verb + object ("Составить трекер времени")
 4. `rationale` — 1 sentence; explains bottleneck → element
-5. `applied_note` — null if `plan_skeleton.applied_section` is absent/null, otherwise 2-4 sentences per H3.5 (Russian, informal "ты")
+5. `applied_note` — per H3.6 if top-level `applied_topic.sections_count > 0`; else per H3.5 if `plan_skeleton.applied_section` is present; else null. Never both at once
 6. `trigger_response` — empty string for `routine`; an explanation of the reaction for other triggers
 7. `decision_log` — copy from the input JSON, don't change anything
 8. JSON only — no surrounding text

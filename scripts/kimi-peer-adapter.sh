@@ -7,7 +7,7 @@
 # вызывает Kimi с очищенной директорией.
 #
 # Env overrides:
-#   IWE_PEER_LOCK_DIR     — pidfile lock directory (default: /tmp/kimi-peer-locks)
+#   IWE_PEER_LOCK_DIR     — pidfile lock directory (default: ~/.iwe/kimi-peer-locks; legacy /tmp/kimi-peer-locks is used only while it alone holds the OAuth fence, see kimi_lock_root)
 #   IWE_PEER_DIFF         — enable session-state diff (git diff HEAD) (default: 0)
 #   IWE_PEER_DIFF_REPOS   — CSV of repos for diff (default: auto-detect from first --add-dir)
 #   IWE_PEER_DIFF_LIMIT   — soft limit for diff size in bytes (default: 61440)
@@ -46,9 +46,39 @@ if ! source "$SCRIPT_DIR/lib/peer-adapter-common.sh"; then
   exit 1
 fi
 
+# Where the peer lock root (and with it the immutable OAuth v4 fence) lives.
+# A fixed /tmp path lost the fence whenever macOS wiped /tmp (reboot, 3-day
+# sweep), and every Kimi call then failed with "cutover required" (bug
+# 2026-09-17, recurrences 23.09, 24.09, 29.09). Resolution order:
+#   1. IWE_PEER_LOCK_DIR, explicit;
+#   2. the durable dir (per USER, ~/.iwe: the lock guards the user's shared Kimi
+#      OAuth data, so it must not depend on which workspace or runtime started
+#      the call), when it already carries a fence;
+#   3. the legacy /tmp dir, when only it carries a fence (transition: hosts that
+#      already ran the cutover keep working until the first wipe);
+#   4. the durable dir (new installs; the one cutover after a wipe lands here
+#      and never has to be repeated).
+# Duplicated verbatim in kimi-wp-run-scheduled.sh; kimi-lock-root-resolution-smoke.sh
+# fails if the two ever disagree.
+kimi_lock_root() {
+  local durable legacy
+  if [ -n "${IWE_PEER_LOCK_DIR:-}" ]; then
+    printf '%s\n' "$IWE_PEER_LOCK_DIR"
+    return 0
+  fi
+  durable="${IWE_STATE_DIR:-$HOME/.iwe}/kimi-peer-locks"
+  legacy="${IWE_PEER_LEGACY_LOCK_DIR:-/tmp/kimi-peer-locks}"
+  if [ ! -e "$durable/kimi-oauth-refresh.lockdir" ] && [ -e "$legacy/kimi-oauth-refresh.lockdir" ]; then
+    printf '%s\n' "$legacy"
+  else
+    printf '%s\n' "$durable"
+  fi
+}
+
 # Declared before cleanup_peer's trap is armed (below) so `set -u` can't fault
 # on an unset read if the script exits early, before the lock is ever attempted.
-OAUTH_LOCK_DIR="${IWE_PEER_LOCK_DIR:-/tmp/kimi-peer-locks}/kimi-oauth-refresh.lockdir"
+KIMI_LOCK_ROOT=$(kimi_lock_root)
+OAUTH_LOCK_DIR="$KIMI_LOCK_ROOT/kimi-oauth-refresh.lockdir"
 
 # A pre-v4 scheduler can pause after deciding that the historical mkdir lock
 # is stale and resume its unconditional `rm -rf` after a new implementation
@@ -66,7 +96,7 @@ if [ "${1:-}" = "--cutover-oauth-lineage-v4" ]; then
     echo "ERROR: this shell does not preserve the deployed legacy 'kill -0 -1' fence contract." >&2
     exit 1
   fi
-  python3 - "${IWE_PEER_LOCK_DIR:-/tmp/kimi-peer-locks}" "$OAUTH_LOCK_DIR" <<'PY'
+  python3 - "$KIMI_LOCK_ROOT" "$OAUTH_LOCK_DIR" <<'PY'
 import errno
 import fcntl
 import os
@@ -614,7 +644,7 @@ _KIMI_SESSION_START_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 # group. Either owner surviving a single fault drains the vendor; even loss of
 # both owners leaves new writers blocked by the live vendor group until FIFO
 # lineage is gone.
-LOCK_DIR="${IWE_PEER_LOCK_DIR:-/tmp/kimi-peer-locks}"
+LOCK_DIR="$KIMI_LOCK_ROOT"
 SESSION_LOCK_DIR="$LOCK_DIR/${KIMI_SESSION_ID}.lock"
 LOCK_FILE="$SESSION_LOCK_DIR/owner.pid"
 LEGACY_LOCK_FILE="$LOCK_DIR/${KIMI_SESSION_ID}.pid"

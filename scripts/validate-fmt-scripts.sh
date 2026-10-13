@@ -201,6 +201,27 @@ if [[ "$MODE" != "settings-json" ]]; then
                                 continue
                             fi
                         fi
+                        # issue #1135: the literal's only occurrence sits inside a
+                        # trailing comment that explains why the code earlier on
+                        # the line already covers it (e.g. a shellcheck directive
+                        # reference, another issue number, or a WP- id) — same
+                        # "comments don't affect behavior" contract as the
+                        # whole-line-comment skip above. Two conditions, both
+                        # required: (a) the literal must actually disappear once
+                        # we cut from the first whitespace-preceded `#` onward —
+                        # a hardcode sitting BEFORE that `#`, with an unrelated
+                        # marker word further in the same trailing comment, must
+                        # still be caught; (b) what remains of the comment must
+                        # carry one of the markers actually seen in practice —
+                        # staying a narrow whitelist, not "any trailing comment",
+                        # since a general comment/quote-aware parser is not
+                        # reliable here (a `#` can legitimately sit inside a
+                        # quoted string too).
+                        if ! echo "$bl" | sed -E 's/[[:space:]]#.*$//' | grep -q "$AUTHOR_GOV_REPO"; then
+                            if echo "$bl" | grep -qE '[[:space:]]#.*\b(shellcheck|WP-[0-9]+|issue[[:space:]]*#[0-9]+)\b'; then
+                                continue
+                            fi
+                        fi
                     fi
                     echo "$bl"
                 done)

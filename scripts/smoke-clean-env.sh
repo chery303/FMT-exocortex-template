@@ -26,8 +26,12 @@ else
     echo "SAFE-MODE: PASS"
 fi
 
-# 3. Shebang
-if ! head -1 "$file" | grep -q '^#!/' >/dev/null 2>&1; then
+# 3. Shebang (sourced-only libraries are exempt — they declare functions and
+# are never executed directly; detected via a "Sourced, not executed" marker
+# in the header, issue #1130)
+if head -n 10 "$file" | grep -qE '^#[[:space:]]*.*Sourced, not executed'; then
+    echo "SHEBANG: skipped (sourced, not executed)"
+elif ! head -1 "$file" | grep -q '^#!/' >/dev/null 2>&1; then
     echo "SHEBANG: missing"
     FAIL=1
 else

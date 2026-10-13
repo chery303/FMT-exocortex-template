@@ -35,8 +35,17 @@ _DEGREE_PATH = "3_derived/3_8_degree"
 # Fallback for fetch_stage() when the live platform is unreachable (WP-149
 # bug-2026-07-12): a periodic local snapshot (WP-425, launchd Sunday 08:00),
 # used only if the platform round-trip fails outright.
+# issue #1132 (FMT-exocortex-template): was hardcoded to the platform
+# author's own personal governance-repo path — wrong for every other
+# installation. Resolves via IWE_ROOT/IWE_WORKSPACE and IWE_GOVERNANCE_REPO,
+# same convention scripts/update-derived-snapshot.py uses on the FMT side,
+# and the same ".cache/" location that replaces "inbox/WP-425/" there.
+_IWE_ROOT = pathlib.Path(
+    os.environ.get("IWE_ROOT") or os.environ.get("IWE_WORKSPACE") or (pathlib.Path.home() / "IWE")
+).expanduser()
+_GOVERNANCE_REPO = os.environ.get("IWE_GOVERNANCE_REPO", "DS-strategy")
 _DEFAULT_SNAPSHOT_CACHE = str(
-    pathlib.Path.home() / "IWE/DS-my-strategy/inbox/WP-425/cache/derived_snapshot.json"
+    _IWE_ROOT / _GOVERNANCE_REPO / ".cache/derived_snapshot.json"
 )
 _SNAPSHOT_STALE_DAYS = 14  # weekly refresh + one missed run of slack
 

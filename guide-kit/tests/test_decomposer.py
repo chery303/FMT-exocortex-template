@@ -334,5 +334,51 @@ class TestDecomposerEmptyInput:
         assert any("no sections" in log["message"].lower() for log in result.decision_log)
 
 
+class TestDecomposerNoFileAccess:
+    """Decomposer не обращается к файловой системе напрямую (условие 03.08)."""
+
+    def test_decompose_topic_does_not_touch_filesystem(self, monkeypatch):
+        """decompose_topic принимает готовый dict и не вызывает open/os.path."""
+
+        calls = []
+
+        def mock_open(*args, **kwargs):
+            calls.append(("open", args, kwargs))
+            raise AssertionError("decompose_topic must not call open()")
+
+        def mock_isfile(*args, **kwargs):
+            calls.append(("isfile", args, kwargs))
+            raise AssertionError("decompose_topic must not call os.path.isfile()")
+
+        def mock_exists(*args, **kwargs):
+            calls.append(("exists", args, kwargs))
+            raise AssertionError("decompose_topic must not call os.path.exists()")
+
+        monkeypatch.setattr("builtins.open", mock_open)
+        monkeypatch.setattr("os.path.isfile", mock_isfile)
+        monkeypatch.setattr("os.path.exists", mock_exists)
+
+        topic = {
+            "scenario": "learn",
+            "mode": "B",
+            "topic_name": "Pure Dict",
+            "source_url": "http://test.com",
+            "source_type": "book",
+            "sections": [
+                {
+                    "id": "s1",
+                    "title": "Ch1",
+                    "source_location": "Ch1",
+                    "learning_objectives": [],
+                    "estimated_hours": 1,
+                }
+            ],
+        }
+
+        result = decompose_topic(topic)
+        assert result.topic_name == "Pure Dict"
+        assert calls == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -33,17 +33,17 @@ description: "Операционный файл памяти IWE"
 | R8 | **Синхронизатор** | — | скрипт + скилл | `/connect-guide` `/setup-wakatime` `/loop`* `/schedule`* | Scheduler, code-scan, pack projection, notify |
 | R9 | **Шаблонизатор** | FX8 | скилл | `/iwe-update` `/extend` `/init`* `/update-config`* `/keybindings-help`* `/fewer-permission-prompts`* | Template sync, drift detection, validation |
 | R10 | **Статистик** | — | скрипт | — | Метрики, аналитика, time tracking |
-| R11 | **Наладчик** | — | inline | — | FSM unstick, auto-fix, restart, escalate |
+| R11 | **Наладчик** | — | inline (носитель строится: WP-516 Ф3 аварийный контур + WP-545 Ф8 регламентный, 01.09.2026) | — | FSM unstick, auto-fix, restart, escalate; «ремонтник» — разговорный синоним пилота; каталог починок proposed/validated/enabled — общий артефакт двух РП |
 | R12 | **Оценщик** | — | sub-agent | — | Bloom eval, WP validation, fixation |
 | R13 | **Проводник** | FX6 | скилл + скрипт | `/consent` | FSM routing, tier gating, progressive disclosure |
 | R21 | **Публикатор** | FX1 | скрипт | — | Scan ready posts, scheduled publish, comment check |
 | R23 | **Верификатор** | — | sub-agent | `/verify` | Проверка артефактов по эталону (Pack/SPF). Context isolation |
 | R24 | **Аудитор** | — | sub-agent + скилл | `/audit-installation` `/audit-docs` `/iwe-rules-review` `/check-secret` `/security-review`* | Проверка полноты и согласованности (coverage, кросс-контекст) |
-| R27 | **Навигатор** | — | скилл | `/lesson` `/lesson-close` `/personal-guide-start` `/personal-guide-render` `/week-close-pilot` `/w-reflection` | Траектория развития, выбор программы, ритм обучения, мемы, итоги |
-| R28 | **Диагност** | — | inline | — | Определение ступени мастерства (0-4) и bottleneck через диалог |
 | R29 | **Артефактор** | — | скилл | `/artifactor` | Этапная декомпозиция деятельности, материальные I/O, чеклист приёмки, детектор разрывов |
 | R30 | **Создатель паков** | — | inline + скилл | `/pack-creator` (отложен) | LLM-сопровождение автора PACK-X через SPF-цикл 01-11; режим по cp-профилю (assembly/hybrid/full); защита read-only upstream FPF/SPF. См. DP.SC.048, DP.ROLE.062 |
 | R31 | **Менеджер оргразвития** | — | inline | — | Проводник от запроса об оргизменении (себя/команды/организации) к конкретному первому шагу из СИ/СМ/ИЛ. Шаг 0 — MIM.M.030 (классификатор типа системы). См. DP.SC.049, DP.ROLE.063 |
+
+> **Правка 12.08 (аудит реестра WP-498):** R27/R28 здесь ранее ошибочно указывали Навигатор/Диагност — это конвенция `FMT-exocortex-template` (Кластер А), не канон `DP.ROLE.001` (Кластер Б: **R27=Портной**, **R28=Профилировщик**, см. §3.2 платформенного реестра). Полный ренейм по шаблону/downstream — отдельный РП (не открыт). Навигатор = `MIM.R.007`, Диагност = `MIM.R.009`/`DP.ROLE.042` — Pack-роли МИМ, без платформенного R-номера. См. также **Наставник** (`MIM.R.001`, зонтичная роль: Режим 1 — плановый разбор; Режим 2 — always-on связка MIM.R.001⊗MIM.R.007⊗MIM.R.009⊗MIM.R.011, WP-498), **Онбордер** (`DP.ROLE.067`, WP-406) и **Секретарь** (`DP.ROLE.098`, WP-389, черновик 15.08 — читает журнал гипотез/событий/портфель РП, доставляет созревшие обязательства с отменой, отвечает на прямой вопрос пилота; не путать с «Секретарём очереди решений» внутри WP-503, тот работает только с портфелем РП на цехе-1) — эти роли активны, но отсутствуют в нумерованном каталоге §3.2 `DP.ROLE.001` (Pack-роли идентифицируются своим ID, не R-номером).
 
 ## Проектные подроли (S2R матрица 3×3)
 

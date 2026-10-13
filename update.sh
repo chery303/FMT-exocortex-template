@@ -108,9 +108,12 @@ CURL_BASE_OPTS="${CURL_OPTS:---max-time 20}"
 _CURL_SSL_OPT=""
 case "${OSTYPE:-}" in
   msys*|cygwin*)
-    if curl --help 2>&1 | grep -q "ssl-revoke-best-effort"; then
+    # issue #1150: the short `curl --help` lists only the common options and
+    # never shows these two; the full list is `curl --help all`.
+    _CURL_HELP_ALL=$(curl --help all 2>&1 || true)
+    if printf '%s\n' "$_CURL_HELP_ALL" | grep -q "ssl-revoke-best-effort"; then
       _CURL_SSL_OPT="--ssl-revoke-best-effort"
-    elif curl --help 2>&1 | grep -q "ssl-no-revoke"; then
+    elif printf '%s\n' "$_CURL_HELP_ALL" | grep -q "ssl-no-revoke"; then
       _CURL_SSL_OPT="--ssl-no-revoke"
     fi
     ;;
@@ -154,7 +157,8 @@ fetch_update_manifest() {
             # shellcheck disable=SC2086
             curl $CURL_BASE_OPTS $_CURL_SSL_OPT -sSfL "$url" >"$part" 2>"$errf" || rc=$?
         fi
-        err_line=$(tail -n 1 "$errf" 2>/dev/null | cut -c1-200)
+        # tr -d '\r': a native Windows curl ends its stderr lines with CRLF (issue #1150).
+        err_line=$(tail -n 1 "$errf" 2>/dev/null | tr -d '\r' | cut -c1-200)
         if [ "$rc" -eq 0 ] && [ ! -s "$part" ]; then
             err_line="curl завершился без ошибки, но файл пуст"
         elif [ "$rc" -eq 0 ] && [ "$(tr -d ' \t\r\n' < "$part" | head -c 1)" != "{" ]; then
@@ -164,7 +168,7 @@ fetch_update_manifest() {
             return 1
         elif [ "$rc" -eq 0 ]; then
             if ! mv -f "$part" "$dest" 2>"$errf"; then
-                FETCH_MANIFEST_DIAG="манифест скачан, но не записан на место: $(tail -n 1 "$errf" | cut -c1-200)"
+                FETCH_MANIFEST_DIAG="манифест скачан, но не записан на место: $(tail -n 1 "$errf" | tr -d '\r' | cut -c1-200)"
                 echo "  ⚠ Попытка $attempt из $max_attempts: $FETCH_MANIFEST_DIAG"
                 rm -f "$part" "$errf"
                 return 1
@@ -727,6 +731,27 @@ apply_memory_policy() {
     return 0
 }
 
+# prune_memory_backups — keep .backups/memory-pre-update/ from growing for ever (issue #1006).
+# Every run that replaces a memory file saves the old copy in its own dated directory; nothing
+# removed them. Remove run directories older than IWE_MEMORY_BACKUP_KEEP_DAYS (default 30), but
+# always keep the newest three. Only directories named like a run (YYYYMMDDTHHMMSSZ-PID) are touched.
+prune_memory_backups() {
+    local root="$WORKSPACE_DIR/.backups/memory-pre-update" days="${IWE_MEMORY_BACKUP_KEEP_DAYS:-30}" d n=0
+    [ -d "$root" ] || return 0
+    case "$days" in ''|*[!0-9]*) days=30 ;; esac
+    while IFS= read -r d; do
+        n=$((n + 1))
+        [ "$n" -le 3 ] && continue
+        case "$d" in
+            [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*) ;;
+            *) continue ;;
+        esac
+        [ -d "$root/$d" ] || continue
+        [ -n "$(find "$root/$d" -maxdepth 0 -mtime +"$days" 2>/dev/null)" ] && rm -rf -- "$root/$d"
+    done < <(ls -1t "$root" 2>/dev/null)
+    return 0
+}
+
 # report_memory_policy_summary — the closing lines of the memory pass: every file this run
 # replaced with the backup directory, and every file it left as it was. repair_pass() prints them:
 # it runs after Step 6 on every path that writes memory, so the lists are complete there.
@@ -734,8 +759,13 @@ report_memory_policy_summary() {
     local f replaced="" kept=""
     for f in ${MEMORY_REPLACED[@]+"${MEMORY_REPLACED[@]}"}; do replaced="${replaced:+$replaced, }$f"; done
     for f in ${MEMORY_KEPT[@]+"${MEMORY_KEPT[@]}"}; do kept="${kept:+$kept, }$f"; done
+    # issue #1006: the closing lines of the memory pass are the one place every run goes through,
+    # so old backup runs are pruned here (the run just made is the newest and always stays).
+    prune_memory_backups
     if [ -n "$replaced" ]; then
-        echo "  ⚠ Заменено файлов памяти: ${#MEMORY_REPLACED[@]} ($replaced); прежние версии сохранены в $MEMORY_BACKUP_RUN"
+        # issue #1006: only a copy proven untouched is ever replaced (apply_memory_policy), so this
+        # is a note, not a warning: no edit of the user's was lost; the old copies stay in the backup.
+        echo "  ℹ Заменено файлов памяти: ${#MEMORY_REPLACED[@]} ($replaced); ваших правок в них не было (заменяются только неизменённые копии), прежние версии сохранены в $MEMORY_BACKUP_RUN"
     fi
     if [ -n "$kept" ]; then
         echo "  ⚠ Не обновлено файлов памяти: ${#MEMORY_KEPT[@]} ($kept); почему и что сделать — в строке каждого файла выше"
@@ -2718,6 +2748,11 @@ run_post_apply_backfills_or_die() {
     backfill_ds_publish || echo "  ⚠ scripts/ds-publish.sh не доставлен: ночные роли оставят коммиты локальными, пока его нет (issue #941)." >&2
 
     echo ""
+    echo "Гейт публикации publish-gate.sh (upgrade backfill)..."
+    backfill_governance_seed_script "scripts/lib/publish-gate.sh" \
+        || echo "  ⚠ scripts/lib/publish-gate.sh не доставлен: Экстрактор останется на сыром git push без повтора при устаревшем origin/main (issue #1102)." >&2
+
+    echo ""
     echo "Executor catalog (upgrade backfill)..."
     backfill_executor_catalog || true
 
@@ -3002,6 +3037,22 @@ iwe_claude_project_slug() {
     printf '%s' "$path" | sed 's/[^A-Za-z0-9]/-/g'
 }
 
+# memory_paths_equal A B — true when two directory paths name the same place.
+# issue #1099 (item 2): on Windows (Git Bash) the file system ignores case, and a
+# path built from `cygpath -w` may write the drive letter in the other case
+# ("C:" vs "c:"), so a plain string comparison stopped the updater at start for
+# one and the same directory. Elsewhere the comparison stays exact.
+memory_paths_equal() {
+    [ "$1" = "$2" ] && return 0
+    case "${OSTYPE:-}" in
+        msys*|cygwin*)
+            [ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" = \
+              "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" ] && return 0
+            ;;
+    esac
+    return 1
+}
+
 resolve_workspace_memory_dir() {
     local workspace="$1" physical="" computed slug legacy_slug legacy_dir
     slug=$(iwe_claude_project_slug "$workspace")
@@ -3011,7 +3062,7 @@ resolve_workspace_memory_dir() {
     fi
     if [ -n "$physical" ] && [ -d "$computed" ]; then
         computed=$(cd -P "$computed" 2>/dev/null && pwd -P) || return 1
-        if [ "$physical" != "$computed" ]; then
+        if ! memory_paths_equal "$physical" "$computed"; then
             # issue #869: installs made before the single slug rule pointed workspace/memory at
             # a directory named by an older rule ("tr /", "tr /_.", "tr /_ "). For a path with a
             # space or other punctuation that is not the directory Claude Code uses. The physical
@@ -3575,6 +3626,30 @@ echo ""
 # только номер. python3 недоступен → откат на version-only с явной пометкой
 # (не тихий даунгрейд гарантии).
 if $CHECK_ONLY && $FAST_CHECK; then
+    # issue #1185: the fast path used to skip straight to the version/files
+    # comparison below, which only reports "differs" either way -- a local
+    # install ahead of the release read as "update available" instead of
+    # "applying this would roll you back". Same check and wording as the
+    # full --check path (#863), just run before the fast-path exit instead
+    # of after the full file-diff walk.
+    _fast_rollback_code=1
+    if detect_release_rollback; then
+        _fast_rollback_code=0
+    else
+        _fast_last_rc=$?
+        [ "$_fast_last_rc" -eq 2 ] && _fast_rollback_code=2
+    fi
+    if [ "$_fast_rollback_code" -eq 0 ]; then
+        echo "🔴 ВНИМАНИЕ: локальная установка новее последнего релиза."
+        echo "   Применение обновления release-каналом ОТКАТИТ установку на более старый снимок."
+        echo "   Чтобы получить актуальную main, запустите: IWE_UPDATE_CHANNEL=main bash update.sh"
+        echo ""
+    elif [ "$_fast_rollback_code" -eq 2 ]; then
+        echo "⚠️ ВНИМАНИЕ: не удалось проверить историю релиза; автоматическое применение с --yes заблокировано."
+        echo "   Чтобы получить актуальную main, запустите: IWE_UPDATE_CHANNEL=main bash update.sh"
+        echo ""
+    fi
+
     LOCAL_MANIFEST="$SCRIPT_DIR/update-manifest.json"
     LOCAL_VERSION=""
     [ -f "$LOCAL_MANIFEST" ] && LOCAL_VERSION=$(manifest_version "$LOCAL_MANIFEST")
@@ -3588,7 +3663,7 @@ if $CHECK_ONLY && $FAST_CHECK; then
 import json, sys
 def files_key(path):
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
     except Exception:
         return None
@@ -3696,7 +3771,7 @@ repair_pass() {
     if py_available; then
         if ! $PY_BIN -c "
 import json, sys
-with open(sys.argv[1]) as f:
+with open(sys.argv[1], encoding='utf-8') as f:
     data = json.load(f)
 for entry in data.get('files', []):
     print(entry['path'] + '|')
@@ -4180,7 +4255,7 @@ if py_available; then
     # "no changes."
     if ! $PY_BIN -c "
 import json, sys
-with open(sys.argv[1]) as f:
+with open(sys.argv[1], encoding='utf-8') as f:
     data = json.load(f)
 for entry in data.get('files', []):
     print(entry['path'] + '|' + entry.get('desc', '') + '|' + entry.get('sha256', ''))
@@ -4374,7 +4449,7 @@ import json, sys
 
 path = sys.argv[1]
 try:
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         data = json.load(f)
     for entry in data.get('excluded_paths', []):
         print(entry['path'] if isinstance(entry, dict) else entry)
@@ -4711,7 +4786,7 @@ done < <(
     if py_available; then
         $PY_BIN -c "
 import json, sys
-with open(sys.argv[1]) as f:
+with open(sys.argv[1], encoding='utf-8') as f:
     data = json.load(f)
 # 2026-08-22 (external report): a path present in BOTH the delivered files
 # set and deprecated_files is a generator inconsistency — removal deleted 10
@@ -5692,7 +5767,7 @@ if [ -f "$MCP_WORKSPACE" ] && py_available; then
     $PY_BIN -c "
 import json, sys
 
-with open(sys.argv[1]) as f:
+with open(sys.argv[1], encoding='utf-8') as f:
     data = json.load(f)
 
 servers = data.get('mcpServers', {})
@@ -5715,7 +5790,7 @@ if changed:
     ordered = {'iwe-knowledge': servers.pop('iwe-knowledge')}
     ordered.update(servers)
     data['mcpServers'] = ordered
-    with open(sys.argv[1], 'w') as f:
+    with open(sys.argv[1], 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write('\n')
     removed = ', '.join(old_keys) if old_keys else ''
@@ -6038,19 +6113,63 @@ if $ROLES_CHANGED && [ "$(uname -s)" != Linux ] && command -v launchctl >/dev/nu
     # their environment. update.sh already knows all of these; pass them
     # explicitly instead of relying on a file that may not exist.
     ROLE_REINSTALL_GOV="${EFFECTIVE_GOVERNANCE_REPO:-$(effective_governance_repo)}"
+    # BEGIN-TESTABLE: role-reinstall-loop (setup/test-update-issue-1143.sh
+    # extracts exactly this block by these two sentinel comments and evals
+    # it in a sandbox — keep the sentinels on their own line, verbatim, if
+    # this block moves or is edited).
     for role_dir in "$SCRIPT_DIR"/roles/*/; do
         [ -f "$role_dir/install.sh" ] && [ -f "$role_dir/role.yaml" ] || continue
-        if grep -q 'auto:.*true' "$role_dir/role.yaml" 2>/dev/null; then
+        role_name="$(basename "$role_dir")"
+        is_auto=false
+        grep -q 'auto:.*true' "$role_dir/role.yaml" 2>/dev/null && is_auto=true
+
+        # issue #1143: a role with auto:false (synchronizer, extractor) is
+        # never reinstalled here, so a user who installed it before the
+        # plist template changed (e.g. 0.40.0 added IWE_SCRIPTS, line 62)
+        # keeps running the stale plist forever — update.sh only knows how
+        # to activate a role the user never asked for (that's what `auto`
+        # means), not how to refresh one already on disk. Detect "already
+        # installed" generically: every role's install.sh declares its own
+        # `PLIST_DST=` line (same convention across synchronizer/extractor);
+        # the role is already installed if that file exists on disk.
+        plist_dst=""
+        plist_dst_line="$(grep -m1 '^PLIST_DST=' "$role_dir/install.sh" 2>/dev/null)" || true
+        if [ -n "$plist_dst_line" ]; then
+            plist_dst="$(eval "$plist_dst_line"; printf '%s' "$PLIST_DST")"
+        fi
+        already_installed=false
+        [ -n "$plist_dst" ] && [ -f "$plist_dst" ] && already_installed=true
+
+        if $is_auto || $already_installed; then
+            # install.sh unconditionally does `launchctl unload` + `load`
+            # (that's correct for auto:true and for a first-time install),
+            # but for an already-installed auto:false role the user may
+            # have deliberately `launchctl unload`-ed it while leaving the
+            # plist file in place — its `load` would fire RunAtLoad once
+            # before we could undo it, dispatching a job the user turned
+            # off. Detect that case before calling install.sh and tell it
+            # to skip `load` outright (IWE_SKIP_LOAD) instead of racing a
+            # load-then-unload after the fact.
+            was_loaded=false
+            skip_load=""
+            if ! $is_auto && [ -n "$plist_dst" ]; then
+                plist_label="$(basename "$plist_dst" .plist)"
+                launchctl list "$plist_label" >/dev/null 2>&1 && was_loaded=true
+                $was_loaded || skip_load=1
+            fi
+
             IWE_WORKSPACE="$WORKSPACE_DIR" \
             IWE_TEMPLATE="$SCRIPT_DIR" \
             IWE_SCRIPTS="$SCRIPT_DIR/scripts" \
             IWE_RUNTIME="$WORKSPACE_DIR/.iwe-runtime" \
             IWE_GOVERNANCE_REPO="$ROLE_REINSTALL_GOV" \
+            IWE_SKIP_LOAD="$skip_load" \
             bash "$role_dir/install.sh" 2>/dev/null && \
-                echo "  ✓ $(basename "$role_dir") переустановлен" || \
-                echo "  ○ $(basename "$role_dir"): переустановите вручную"
+                echo "  ✓ $role_name переустановлен" || \
+                echo "  ○ $role_name: переустановите вручную"
         fi
     done
+    # END-TESTABLE: role-reinstall-loop
     fi
 fi
 
@@ -6107,7 +6226,7 @@ import json, os, sys
 script_dir = os.path.realpath(sys.argv[1])
 manifest_path = os.path.join(script_dir, "update-manifest.json")
 
-with open(manifest_path) as f:
+with open(manifest_path, encoding='utf-8') as f:
     manifest = json.load(f)
 
 def _path(e): return e["path"] if isinstance(e, dict) else e
@@ -6121,7 +6240,7 @@ local_manifest_path = os.path.join(script_dir, "update-manifest.local.json")
 local_excluded = []
 if os.path.isfile(local_manifest_path):
     try:
-        with open(local_manifest_path) as f:
+        with open(local_manifest_path, encoding='utf-8') as f:
             local_excluded = [_path(e) for e in json.load(f).get("excluded_paths", [])]
     except (json.JSONDecodeError, TypeError) as exc:
         print(f"  [warn] update-manifest.local.json unreadable, ignored: {exc}")

@@ -288,6 +288,15 @@
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-hooks-bootstrap.sh"
           }
         ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/precompact-restore.sh"
+          }
+        ]
       }
     ],
     "SessionEnd": [

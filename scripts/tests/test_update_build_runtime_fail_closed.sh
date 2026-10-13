@@ -471,7 +471,7 @@ OLD_PIPELINE_ACTUAL=$( \
     bash "$GOVERNANCE/scripts/day-open-pipeline.sh"
 )
 GOVERNANCE_PHYSICAL=$(cd "$GOVERNANCE" && pwd -P)
-OLD_PIPELINE_EXPECTED="$GOVERNANCE_PHYSICAL/inbox/WP-425/cache/derived_snapshot.json"
+OLD_PIPELINE_EXPECTED="$GOVERNANCE_PHYSICAL/.cache/derived_snapshot.json"
 OLD_PIPELINE_HASH_AFTER=$(shasum -a 256 "$GOVERNANCE/scripts/day-open-pipeline.sh" | cut -d' ' -f1)
 if [ "$OLD_PIPELINE_ACTUAL" = "$OLD_PIPELINE_EXPECTED" ] && \
    [ "$OLD_PIPELINE_HASH" = "$OLD_PIPELINE_HASH_AFTER" ]; then
