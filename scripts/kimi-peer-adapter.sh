@@ -97,11 +97,14 @@ if [ "${1:-}" = "--cutover-oauth-lineage-v4" ]; then
     exit 1
   fi
   python3 - "$KIMI_LOCK_ROOT" "$OAUTH_LOCK_DIR" <<'PY'
+import ctypes
 import errno
 import fcntl
 import os
+import re
 import secrets
 import stat
+import struct
 import sys
 
 root_directory, fence_path = sys.argv[1:]
@@ -110,6 +113,96 @@ lineage_path = os.path.join(root_directory, "kimi-oauth-refresh.lineage-v4")
 prefix = "kimi-oauth-refresh.fence-v4."
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+# WP-484 Ф181 v5 (15.10, peer-session Claude+Kimi+Codex) + hotfix same day
+# (live crash on the Linux host "Цех" -- fgetattrlist is a macOS-only
+# syscall, missing on every other platform's libc). The pledge used to
+# identify its lease by (st_dev, st_ino, nonce); st_dev is not stable
+# across a macOS reboot even for the exact same file, which was the whole
+# bug (4 recurrences in 3 months). v5 keys off the volume UUID + inode +
+# the lease file's own birthtime instead -- but that fix is macOS-only by
+# construction (fgetattrlist has no portable equivalent), and Linux never
+# had the st_dev-after-reboot instability this exists to fix. IS_MACOS
+# gates every v5 code path; everything else keeps the original v4 scheme
+# byte-for-byte unchanged on non-macOS.
+IS_MACOS = sys.platform == "darwin" and os.environ.get(
+    "IWE_PEER_TEST_FORCE_NOT_MACOS",
+) != "1"
+
+if IS_MACOS:
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+
+    class _AttrList(ctypes.Structure):
+        _fields_ = [
+            ("bitmapcount", ctypes.c_ushort),
+            ("reserved", ctypes.c_ushort),
+            ("commonattr", ctypes.c_uint32),
+            ("volattr", ctypes.c_uint32),
+            ("dirattr", ctypes.c_uint32),
+            ("fileattr", ctypes.c_uint32),
+            ("forkattr", ctypes.c_uint32),
+        ]
+
+    _LIBC.fgetattrlist.argtypes = [
+        ctypes.c_int, ctypes.POINTER(_AttrList), ctypes.c_void_p,
+        ctypes.c_size_t, ctypes.c_ulong,
+    ]
+    _LIBC.fgetattrlist.restype = ctypes.c_int
+
+    _ATTR_CMN_CRTIME = 0x00000200
+    _ATTR_VOL_UUID = 0x00040000
+
+
+class VolumeIdentityUnavailable(RuntimeError):
+    """fgetattrlist(2) could not report a stable volume/birthtime identity."""
+
+    def __init__(self, errno_value, message):
+        super().__init__(message)
+        self.errno = errno_value
+
+
+def _fgetattrlist_one_group(fd, field, bit, size):
+    # macOS fgetattrlist(2): requesting the common and volume attribute
+    # groups TOGETHER in one call returns a common-attribute block that
+    # does not describe the target fd -- verified live on this host:
+    # ATTR_CMN_CRTIME came back pinned to one fixed value for every
+    # distinct file the instant any ATTR_VOL_* bit was also set, while
+    # each group alone matched `stat -f %B`/the real volume UUID exactly.
+    # Each group therefore gets its own isolated call.
+    attrs = _AttrList()
+    attrs.bitmapcount = 5
+    setattr(attrs, field, bit)
+    buf = ctypes.create_string_buffer(size)
+    if _LIBC.fgetattrlist(fd, ctypes.byref(attrs), buf, size, 0) != 0:
+        err = ctypes.get_errno()
+        raise VolumeIdentityUnavailable(err, os.strerror(err))
+    return buf.raw
+
+
+def file_birthtime(fd):
+    raw = _fgetattrlist_one_group(fd, "commonattr", _ATTR_CMN_CRTIME, 20)
+    return struct.unpack_from("<qq", raw, 4)
+
+
+def volume_uuid(fd):
+    raw = _fgetattrlist_one_group(fd, "volattr", _ATTR_VOL_UUID, 20)
+    return raw[4:20].hex()
+
+
+def v5_identity_suffix(fd, ino):
+    crtime_sec, crtime_nsec = file_birthtime(fd)
+    return f"{volume_uuid(fd)} {ino} {crtime_sec}.{crtime_nsec}"
+
+
+def fence_identity(fd, st_dev, st_ino):
+    """(tag, suffix) for the owner-record string -- v5 (macOS only) or the
+    original, unchanged v4 (dev+inode) scheme everywhere else."""
+    if IS_MACOS:
+        return "v5", v5_identity_suffix(fd, st_ino)
+    return "v4", f"{st_dev} {st_ino}"
+
+
+_LEGACY_OWNER_RE = re.compile(r"^iwe-oauth-fence-v4 (\d+) (\d+) ([0-9a-f]{32})$")
 
 
 def same_inode(left, right):
@@ -166,7 +259,7 @@ def fsync_directory(path):
         os.close(descriptor)
 
 
-def validate_fence(lease_value):
+def validate_fence(lease_fd, lease_value):
     link_value = os.lstat(fence_path)
     if not stat.S_ISLNK(link_value.st_mode) or link_value.st_uid != os.getuid():
         return False
@@ -188,10 +281,17 @@ def validate_fence(lease_value):
     pid_fd, pid_value = open_owned_regular(pid_path)
     owner_fd, owner_value = open_owned_regular(owner_path)
     try:
-        expected_owner = (
-            f"iwe-oauth-fence-v4 {lease_value.st_dev} "
-            f"{lease_value.st_ino} {nonce}"
-        )
+        try:
+            tag, identity_suffix = fence_identity(
+                lease_fd, lease_value.st_dev, lease_value.st_ino,
+            )
+        except VolumeIdentityUnavailable as exc:
+            print(
+                f"ERROR: oauth-v5-attrlist-unavailable: errno={exc.errno} {exc}",
+                file=sys.stderr,
+            )
+            return False
+        expected_owner = f"iwe-oauth-fence-{tag} {identity_suffix} {nonce}"
         return (
             read_ascii(pid_fd) == "-1"
             and read_ascii(owner_fd) == expected_owner
@@ -203,6 +303,81 @@ def validate_fence(lease_value):
         )
     finally:
         os.close(owner_fd)
+        os.close(pid_fd)
+
+
+def migrate_v4_fence_to_v5(lease_fd, lease_value):
+    """Recognize this process's own pre-reboot v4 pledge and rewrite its
+    owner record to the v5 identity format, atomically, under the flock
+    already held on lease_fd. dev is deliberately NOT checked (that is the
+    unstable value this migration exists to replace) -- ino and nonce (both
+    the directory name and the value embedded in the old string) must match
+    exactly. Returns True only if a migration happened."""
+    try:
+        link_value = os.lstat(fence_path)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISLNK(link_value.st_mode) or link_value.st_uid != os.getuid():
+        return False
+    target = os.readlink(fence_path)
+    if not target.startswith(prefix) or "/" in target:
+        return False
+    dir_nonce = target[len(prefix):]
+    if not valid_nonce(dir_nonce):
+        return False
+    private_path = os.path.join(root_directory, target)
+    try:
+        private_value = os.lstat(private_path)
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISDIR(private_value.st_mode)
+            or private_value.st_uid != os.getuid()
+            or stat.S_IMODE(private_value.st_mode) != 0o700
+            or sorted(os.listdir(private_path)) != ["owner", "pid"]):
+        return False
+    pid_path = os.path.join(private_path, "pid")
+    owner_path = os.path.join(private_path, "owner")
+    pid_fd, _pid_value = open_owned_regular(pid_path)
+    try:
+        if read_ascii(pid_fd) != "-1":
+            return False
+        owner_fd, _owner_value = open_owned_regular(owner_path)
+        try:
+            match = _LEGACY_OWNER_RE.match(read_ascii(owner_fd))
+            if not match:
+                return False
+            legacy_ino, legacy_nonce = match.group(2), match.group(3)
+            if int(legacy_ino) != lease_value.st_ino or legacy_nonce != dir_nonce:
+                return False
+            try:
+                new_payload = (
+                    f"iwe-oauth-fence-v5 "
+                    f"{v5_identity_suffix(lease_fd, lease_value.st_ino)} "
+                    f"{dir_nonce}"
+                )
+            except VolumeIdentityUnavailable as exc:
+                print(
+                    f"ERROR: oauth-v5-attrlist-unavailable: errno={exc.errno} {exc}",
+                    file=sys.stderr,
+                )
+                return False
+            tmp_path = f"{owner_path}.{os.getpid()}.migrate"
+            tmp_fd = os.open(
+                tmp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC,
+                0o600,
+            )
+            try:
+                os.write(tmp_fd, (new_payload + "\n").encode("ascii"))
+                os.fsync(tmp_fd)
+            finally:
+                os.close(tmp_fd)
+            os.replace(tmp_path, owner_path)
+            fsync_directory(private_path)
+            return True
+        finally:
+            os.close(owner_fd)
+    finally:
         os.close(pid_fd)
 
 
@@ -222,10 +397,19 @@ try:
     if not path_names_inode(lease_path, lease_value):
         raise SystemExit("ERROR: OAuth lease changed during cutover")
     if os.path.lexists(fence_path):
-        if validate_fence(lease_value) and not os.path.lexists(lineage_path):
+        if validate_fence(lease_fd, lease_value) and not os.path.lexists(lineage_path):
             print("OAuth lineage v4 cutover already complete")
             raise SystemExit(0)
-        raise SystemExit("ERROR: existing OAuth bridge is not the exact v4 fence")
+        # Migration only makes sense on macOS (v4->v5); on every other
+        # platform the fence has always been, and remains, v4 -- nothing
+        # to migrate, so this path is skipped entirely.
+        if (IS_MACOS
+                and migrate_v4_fence_to_v5(lease_fd, lease_value)
+                and validate_fence(lease_fd, lease_value)
+                and not os.path.lexists(lineage_path)):
+            print("OAuth lineage v4->v5 identity migration complete")
+            raise SystemExit(0)
+        raise SystemExit("ERROR: existing OAuth bridge is not the exact v4 or v5 fence")
     if os.path.lexists(lineage_path):
         raise SystemExit("ERROR: existing OAuth v4 lineage blocks cutover")
 
@@ -237,18 +421,25 @@ try:
     os.mkdir(private_path, 0o700)
     published = False
     try:
+        try:
+            tag, identity_suffix = fence_identity(
+                lease_fd, lease_value.st_dev, lease_value.st_ino,
+            )
+        except VolumeIdentityUnavailable as exc:
+            raise RuntimeError(
+                f"oauth-v5-attrlist-unavailable: errno={exc.errno} {exc}"
+            )
         publish_owned_regular(pid_path, "-1")
         publish_owned_regular(
             owner_path,
-            f"iwe-oauth-fence-v4 {lease_value.st_dev} "
-            f"{lease_value.st_ino} {nonce}",
+            f"iwe-oauth-fence-{tag} {identity_suffix} {nonce}",
         )
         fsync_directory(private_path)
         os.symlink(target, fence_path)
         published = True
         fsync_directory(root_directory)
-        if not validate_fence(lease_value):
-            raise RuntimeError("published OAuth v4 fence failed validation")
+        if not validate_fence(lease_fd, lease_value):
+            raise RuntimeError(f"published OAuth {tag} fence failed validation")
     except Exception:
         if not published:
             for path in (owner_path, pid_path):
@@ -706,6 +897,7 @@ acquire_session_lock() {
       "$SESSION_VENDOR_EXEC_GATE" "$OAUTH_LOCK_DIR" \
       "$SESSION_OAUTH_REQUEST" "$SESSION_OAUTH_READY" \
       "$IWE_PEER_OAUTH_LOCK_TIMEOUT_SECONDS" "$OUR_PID" 9>&- <<'PY' &
+import ctypes
 import errno
 import fcntl
 import json
@@ -713,6 +905,7 @@ import os
 import secrets
 import signal
 import stat
+import struct
 import sys
 import time
 
@@ -754,6 +947,7 @@ oauth_fence_pid_value = None
 oauth_fence_owner_fd = None
 oauth_fence_owner_value = None
 oauth_fence_owner_payload = None
+oauth_fence_last_error = None
 oauth_lineage_path = os.path.join(
     root_directory, "kimi-oauth-refresh.lineage-v4",
 )
@@ -789,6 +983,86 @@ CREATE_FLAGS = os.O_RDWR | os.O_CREAT | NOFOLLOW | CLOEXEC
 EXCLUSIVE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC
 READ_FLAGS = os.O_RDONLY | NOFOLLOW | CLOEXEC
 READWRITE_FLAGS = os.O_RDWR | NOFOLLOW | CLOEXEC
+
+# WP-484 Ф181 v5 (15.10, peer-session Claude+Kimi+Codex) -- see the cutover
+# script above for the full rationale. Same helpers, duplicated here because
+# this is a separate embedded python program (existing convention in this
+# file: same_inode/path_names_inode/fsync_directory are already duplicated
+# the same way). IS_MACOS hotfix (same day, live crash on Linux host "Цех"):
+# fgetattrlist is macOS-only -- gate the whole binding, not just its callers.
+IS_MACOS = sys.platform == "darwin" and os.environ.get(
+    "IWE_PEER_TEST_FORCE_NOT_MACOS",
+) != "1"
+
+if IS_MACOS:
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+
+    class _AttrList(ctypes.Structure):
+        _fields_ = [
+            ("bitmapcount", ctypes.c_ushort),
+            ("reserved", ctypes.c_ushort),
+            ("commonattr", ctypes.c_uint32),
+            ("volattr", ctypes.c_uint32),
+            ("dirattr", ctypes.c_uint32),
+            ("fileattr", ctypes.c_uint32),
+            ("forkattr", ctypes.c_uint32),
+        ]
+
+    _LIBC.fgetattrlist.argtypes = [
+        ctypes.c_int, ctypes.POINTER(_AttrList), ctypes.c_void_p,
+        ctypes.c_size_t, ctypes.c_ulong,
+    ]
+    _LIBC.fgetattrlist.restype = ctypes.c_int
+
+    _ATTR_CMN_CRTIME = 0x00000200
+    _ATTR_VOL_UUID = 0x00040000
+
+
+class VolumeIdentityUnavailable(RuntimeError):
+    """fgetattrlist(2) could not report a stable volume/birthtime identity."""
+
+    def __init__(self, errno_value, message):
+        super().__init__(message)
+        self.errno = errno_value
+
+
+def _fgetattrlist_one_group(fd, field, bit, size):
+    # Requesting common and volume attribute groups TOGETHER in one call
+    # returns a common-attribute block that does not describe the target
+    # fd (verified live: ATTR_CMN_CRTIME came back pinned to one fixed
+    # value for every distinct file the instant any ATTR_VOL_* bit was
+    # also set). Each group gets its own isolated call.
+    attrs = _AttrList()
+    attrs.bitmapcount = 5
+    setattr(attrs, field, bit)
+    buf = ctypes.create_string_buffer(size)
+    if _LIBC.fgetattrlist(fd, ctypes.byref(attrs), buf, size, 0) != 0:
+        err = ctypes.get_errno()
+        raise VolumeIdentityUnavailable(err, os.strerror(err))
+    return buf.raw
+
+
+def file_birthtime(fd):
+    raw = _fgetattrlist_one_group(fd, "commonattr", _ATTR_CMN_CRTIME, 20)
+    return struct.unpack_from("<qq", raw, 4)
+
+
+def volume_uuid(fd):
+    raw = _fgetattrlist_one_group(fd, "volattr", _ATTR_VOL_UUID, 20)
+    return raw[4:20].hex()
+
+
+def v5_identity_suffix(fd, ino):
+    crtime_sec, crtime_nsec = file_birthtime(fd)
+    return f"{volume_uuid(fd)} {ino} {crtime_sec}.{crtime_nsec}"
+
+
+def fence_identity(fd, st_dev, st_ino):
+    """(tag, suffix) for the owner-record string -- v5 (macOS only) or the
+    original, unchanged v4 (dev+inode) scheme everywhere else."""
+    if IS_MACOS:
+        return "v5", v5_identity_suffix(fd, st_ino)
+    return "v4", f"{st_dev} {st_ino}"
 
 
 def publish_status(value):
@@ -906,12 +1180,12 @@ def overwrite_ascii(fd, value):
 
 
 def oauth_owner_record():
-    if oauth_lease_value is None:
+    if oauth_lease_value is None or oauth_lease_fd is None:
         raise RuntimeError("OAuth lease identity unavailable")
-    return (
-        f"iwe-oauth-lineage-v4 {oauth_lease_value.st_dev} "
-        f"{oauth_lease_value.st_ino} {nonce}"
+    tag, suffix = fence_identity(
+        oauth_lease_fd, oauth_lease_value.st_dev, oauth_lease_value.st_ino,
     )
+    return f"iwe-oauth-lineage-{tag} {suffix} {nonce}"
 
 
 def identity_fault(path, value, changed, missing):
@@ -1199,10 +1473,11 @@ def load_exact_oauth_fence():
     global oauth_fence_link_value, oauth_fence_directory_value
     global oauth_fence_pid_fd, oauth_fence_pid_value
     global oauth_fence_owner_fd, oauth_fence_owner_value
-    global oauth_fence_owner_payload
+    global oauth_fence_owner_payload, oauth_fence_last_error
     prefix = "kimi-oauth-refresh.fence-v4."
     local_pid_fd = None
     local_owner_fd = None
+    oauth_fence_last_error = None
     try:
         link_value = os.lstat(oauth_lock_directory)
         if (not stat.S_ISLNK(link_value.st_mode)
@@ -1225,10 +1500,16 @@ def load_exact_oauth_fence():
         owner_path_v4 = os.path.join(fence_directory, "owner")
         local_pid_fd, pid_value = open_existing_owned_regular(pid_path)
         local_owner_fd, owner_value = open_existing_owned_regular(owner_path_v4)
-        owner_payload = (
-            f"iwe-oauth-fence-v4 {oauth_lease_value.st_dev} "
-            f"{oauth_lease_value.st_ino} {fence_nonce}"
-        )
+        try:
+            tag, suffix = fence_identity(
+                oauth_lease_fd, oauth_lease_value.st_dev, oauth_lease_value.st_ino,
+            )
+            owner_payload = f"iwe-oauth-fence-{tag} {suffix} {fence_nonce}"
+        except VolumeIdentityUnavailable as exc:
+            oauth_fence_last_error = (
+                f"oauth-v5-attrlist-unavailable:errno={exc.errno}:{exc}"
+            )
+            return False
         if (read_ascii(local_pid_fd) != "-1"
                 or not process_alive(-1)
                 or read_ascii(local_owner_fd) != owner_payload
@@ -1364,10 +1645,14 @@ def remove_stale_v4_oauth_lineage(link_value):
                 return unlink_exact_link(bridge_name)
             try:
                 owner_record = read_ascii(owner_fd_v4)
-                expected_owner = (
-                    f"iwe-oauth-lineage-v4 {oauth_lease_value.st_dev} "
-                    f"{oauth_lease_value.st_ino} {bridge_nonce}"
-                )
+                try:
+                    tag, suffix = fence_identity(
+                        oauth_lease_fd, oauth_lease_value.st_dev,
+                        oauth_lease_value.st_ino,
+                    )
+                    expected_owner = f"iwe-oauth-lineage-{tag} {suffix} {bridge_nonce}"
+                except VolumeIdentityUnavailable:
+                    return False
                 if owner_record != expected_owner:
                     return False
                 if (not path_names_inode(oauth_lineage_path, link_value)
@@ -1457,7 +1742,7 @@ def acquire_oauth_once():
         oauth_lease_fd = candidate_fd
         oauth_lease_value = candidate_value
         if not load_exact_oauth_fence():
-            publish_failure("oauth-v4-cutover-required")
+            publish_failure(oauth_fence_last_error or "oauth-v4-cutover-required")
             raise RuntimeError(
                 "OAuth v4 cutover fence missing or invalid; explicit "
                 "--cutover-oauth-lineage-v4 required after legacy drain"
@@ -1507,7 +1792,11 @@ def acquire_oauth_once():
                     raise RuntimeError(f"OAuth pre-owner barrier: {fault}")
                 time.sleep(0.02)
 
-        owner_record = oauth_owner_record()
+        try:
+            owner_record = oauth_owner_record()
+        except VolumeIdentityUnavailable as exc:
+            publish_failure(f"oauth-v5-attrlist-unavailable:errno={exc.errno}:{exc}")
+            raise
         publish_exclusive(oauth_owner_path(), owner_record)
         local_owner_fd, local_owner_value = open_existing_owned_regular(
             oauth_owner_path(), writable=True,
@@ -2217,7 +2506,10 @@ cleanup_peer() {
   local hb_reap_guard
   [ "$CLEANUP_PEER_STARTED" = false ] || return 0
   CLEANUP_PEER_STARTED=true
-  [ -x "$_IWE_ARS" ] && bash "$_IWE_ARS" --session-id "$KIMI_SESSION_ID" kimi idle 9>&- 2>/dev/null &
+  if [ -x "$_IWE_ARS" ]; then
+    bash "$_IWE_ARS" --session-id "$KIMI_SESSION_ID" kimi idle \
+      </dev/null >/dev/null 2>&1 9>&- &
+  fi
   # Stop and reap the direct heartbeat helper. It checks the adapter's exact
   # parent relationship itself, so SIGKILL of the adapter also makes it exit.
   # The bounded reap guard prevents an unexpected helper fault from hanging
@@ -2256,7 +2548,10 @@ if ! start_peer_heartbeat; then
   exit 1
 fi
 
-[ -x "$_IWE_ARS" ] && bash "$_IWE_ARS" --session-id "$KIMI_SESSION_ID" kimi peer-session "$KIMI_TASK" 9>&- 2>/dev/null &
+if [ -x "$_IWE_ARS" ]; then
+  bash "$_IWE_ARS" --session-id "$KIMI_SESSION_ID" kimi peer-session "$KIMI_TASK" \
+    </dev/null >/dev/null 2>&1 9>&- &
+fi
 
 # === Запуск Kimi with process-group deadline ===
 # `perl alarm; exec` used to signal only the CLI launcher.  If Kimi had spawned
@@ -2407,11 +2702,21 @@ acquire_oauth_lock() {
   return 1
 }
 if ! acquire_oauth_lock; then
-  if [ "$(cat "$SESSION_LOCK_FAILURE" 2>/dev/null || true)" = "oauth-v4-cutover-required" ]; then
-    echo "ERROR: OAuth lineage v4 cutover is required. Disable and drain every legacy Kimi launcher, then run with --cutover-oauth-lineage-v4 and IWE_OAUTH_CUTOVER_QUIESCED=1." >&2
-  else
-    echo "ERROR: OAuth refresh lock busy after ${IWE_PEER_OAUTH_LOCK_TIMEOUT_SECONDS}s — another Kimi process is mid-refresh on $OAUTH_LOCK_DIR." >&2
-  fi
+  LOCK_FAILURE_TEXT="$(cat "$SESSION_LOCK_FAILURE" 2>/dev/null || true)"
+  case "$LOCK_FAILURE_TEXT" in
+    oauth-v4-cutover-required)
+      echo "ERROR: OAuth lineage v4 cutover is required. Disable and drain every legacy Kimi launcher, then run with --cutover-oauth-lineage-v4 and IWE_OAUTH_CUTOVER_QUIESCED=1." >&2
+      ;;
+    oauth-v5-attrlist-unavailable:*)
+      # WP-484 Ф181 v5: distinct from a missing/invalid fence -- the
+      # macOS volume-identity syscall itself failed, so no amount of
+      # re-running --cutover-oauth-lineage-v4 will fix this on its own.
+      echo "ERROR: $LOCK_FAILURE_TEXT -- macOS volume-identity API (fgetattrlist) failed; the OAuth fence cannot be verified without it on this filesystem/host." >&2
+      ;;
+    *)
+      echo "ERROR: OAuth refresh lock busy after ${IWE_PEER_OAUTH_LOCK_TIMEOUT_SECONDS}s — another Kimi process is mid-refresh on $OAUTH_LOCK_DIR." >&2
+      ;;
+  esac
   exit 1
 fi
 

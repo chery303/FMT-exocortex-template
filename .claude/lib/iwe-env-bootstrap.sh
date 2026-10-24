@@ -153,8 +153,16 @@ esac
 PARAMS_FILE_FOR_BACKUP="${WORKSPACE_DIR}/params.yaml"
 BACKUP_DIR_OVERRIDE=""
 if [ -f "$PARAMS_FILE_FOR_BACKUP" ]; then
+  # issue #1235: a missing backup_dir: key (the common case -- params.yaml.example
+  # doesn't set one) makes grep exit 1; under pipefail that fails the whole
+  # assignment, and bash 3.2 (macOS's /bin/bash, what backup-icloud.sh's
+  # `#!/bin/bash` shebang resolves to) doesn't suspend errexit for a sourced
+  # file the way bash 4.4+/5 do -- the caller silently exits here instead of
+  # falling back to the default iCloud path. `|| true` on the whole pipeline
+  # (not just grep) absorbs any stage's failure, since this value is optional.
   BACKUP_DIR_OVERRIDE=$(grep -E '^backup_dir:' "$PARAMS_FILE_FOR_BACKUP" 2>/dev/null | head -1 \
-    | sed -E 's/^backup_dir:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^["'"'"']//; s/["'"'"']$//')
+    | sed -E 's/^backup_dir:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^["'"'"']//; s/["'"'"']$//' \
+    || true)
   # Same leading-~ expansion as WORKSPACE_DIR above and linear_sync_path in
   # scripts/day-close.sh — bash does not expand ~ inside a variable
   # substitution, so a params.yaml value written the same way as every other

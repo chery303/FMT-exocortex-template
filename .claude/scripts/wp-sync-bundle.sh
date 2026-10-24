@@ -129,6 +129,14 @@ GIT_LOG_DAYS="${WP_SYNC_GIT_DAYS:-14}"
 GIT_SYNC_TIMEOUT="${WP_SYNC_GIT_TIMEOUT:-15}"
 FIND_PYTHON3="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/lib/find-python3.sh"
 GIT_SYNC_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/lib/git-sync-status.sh"
+# issue #1229: a custom layout where .claude/scripts/ and scripts/lib/ are not
+# siblings under the same root (IWE_SCRIPTS from .iwe-paths points elsewhere)
+# never finds the self-relative path above. Fallback only -- the self-relative
+# lookup stays first and unconditional, so the fixture isolation above is untouched.
+if [[ ! -r "$GIT_SYNC_LIB" && -n "${IWE_SCRIPTS:-}" && -f "$IWE_SCRIPTS/lib/git-sync-status.sh" ]]; then
+  echo "[GIT-SYNC] self-relative git-sync-status.sh не найден, пробую \$IWE_SCRIPTS/lib/git-sync-status.sh" >&2
+  GIT_SYNC_LIB="$IWE_SCRIPTS/lib/git-sync-status.sh"
+fi
 if [[ -r "$GIT_SYNC_LIB" ]]; then
   # shellcheck source=/dev/null
   source "$GIT_SYNC_LIB"

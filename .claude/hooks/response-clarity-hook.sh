@@ -84,9 +84,23 @@ PY
 if [ -z "$RESPONSE" ]; then exit 0; fi
 
 LOG_FILE="${HOME}/.claude/logs/style-violations.log"
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 VIOLATIONS=""
+
+# Знаменатель для частотной статистики (peer-session
+# 2026-10-16-14-wp412-base5-mechanism, консенсус Kimi+Codex): лог нарушений
+# сам по себе не говорит, стало ли меньше нарушений или просто меньше
+# проверенных ходов. Одна строка на каждый реально проверенный ход
+# (RESPONSE непустой, мы уже прошли ранний exit выше), отдельно от строк
+# нарушений — не смешиваем формат.
+# Обе записи ниже защищены `|| true` (code review этой же сессии, High):
+# под `set -euo pipefail` неудачный mkdir/echo (диск полон, нет прав,
+# read-only home) иначе прервал бы ВЕСЬ хук до проверки правил — нарушая
+# жёсткий инвариант «хук всегда exit 0».
+CHECKS_LOG="${HOME}/.claude/logs/style-checks-total.log"
+mkdir -p "$(dirname "$CHECKS_LOG")" 2>/dev/null || true
+echo "$TIMESTAMP | $AGENT" >> "$CHECKS_LOG" 2>/dev/null || true
 
 # redact: обрезать до 100 символов, замаскировать токены (в т.ч. короткие
 # провайдерские), заменить разделитель | чтобы не ломать парсер агрегатора
@@ -98,7 +112,7 @@ redact() {
 log_violation() {
   local rule="$1" desc="$2" example="$3"
   VIOLATIONS="${VIOLATIONS}${rule} "
-  echo "$TIMESTAMP | $AGENT | $rule | $desc | $(redact "$example")" >> "$LOG_FILE"
+  echo "$TIMESTAMP | $AGENT | $rule | $desc | $(redact "$example")" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 # --- A1: путь к файлу как подлежащее ---
@@ -123,14 +137,29 @@ A8_MATCH=$(printf '%s\n' "$RESPONSE" | grep -iE '^(Reading|Checking|Looking|Sear
 [ -n "$A8_MATCH" ] && log_violation "A8" "process-journal" "$A8_MATCH"
 
 # --- BASE5: длинное тире вне конструкции «— это» ---
-if printf '%s' "$RESPONSE" | grep -q '—'; then
-  if printf '%s' "$RESPONSE" | perl -CSD -Mutf8 -0777 -ne 'exit(/—(?!\s*это)/ ? 1 : 0)' 2>/dev/null; then
-    : # все тире в конструкции «— это»
-  else
-    BASE5_MATCH=$(printf '%s\n' "$RESPONSE" | grep '—' | head -1 || true)
-    [ -n "$BASE5_MATCH" ] && log_violation "BASE5" "em-dash-outside-eto" "$BASE5_MATCH"
-  fi
-fi
+# Построчная проверка, не по всему тексту (найдено Codex, peer-session
+# 2026-10-16-14-wp412-base5-mechanism): прежняя версия проверяла и грепала
+# ВЕСЬ склеенный ответ одним regex'ом. Два следствия:
+#   (1) `\s*` между тире и «это» матчится и через перевод строки — тире в
+#       конце строки и «это» в начале СЛЕДУЮЩЕЙ ложно считались разрешённым
+#       исключением;
+#   (2) журнал брал первую строку с ЛЮБЫМ тире (`grep '—' | head -1`) — если
+#       разрешённое «X — это Y» стояло раньше настоящего нарушения, в лог
+#       попадал разрешённый пример, не нарушающий.
+# Построчный разбор чинит оба бага одним заходом: `\s*` внутри одной строки
+# не пересекает границу строк, и первая НАРУШАЮЩАЯ строка — это и есть то,
+# что логируется.
+# Граница слова после «это» (Codex): без неё «— этот»/«— этому» матчили
+# исключение, хотя «это» там не самостоятельное слово. Negative lookahead на
+# продолжение кириллицей после «это» закрывает это; `\*{0,2}` перед «это» —
+# разрешённое выделение жирным/курсивом («X — **это** Y»), не нарушение.
+# Perl, не grep: кириллица в классе символов здесь безопасна (в отличие от
+# A10 выше) — это перловый regex с `-CSD -Mutf8`, не GNU grep под C.UTF-8,
+# а прежняя версия BASE5 уже использовала перл с кириллицей в CI без сбоев.
+BASE5_MATCH=$(printf '%s\n' "$RESPONSE" | perl -CSD -Mutf8 -ne '
+  if (/—(?!\s*\*{0,2}это(?![а-яёА-ЯЁ]))/) { print; exit }
+' 2>/dev/null || true)
+[ -n "$BASE5_MATCH" ] && log_violation "BASE5" "em-dash-outside-eto" "$BASE5_MATCH"
 
 # --- Реакция на нарушения (peer-session 2026-06-08-23) ---
 # Два режима. По умолчанию warning (как было). STYLE_ENFORCE_BLOCK=1 включает

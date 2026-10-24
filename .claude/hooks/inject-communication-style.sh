@@ -10,7 +10,11 @@
 #
 # Архитектура (WP-388 Ф8, АрхГейт пройден):
 #   S0 = PACK-digital-platform/.../02-domain-entities/communication-style-base.md (read-only)
-#   S1 = ${IWE_GOVERNANCE_REPO:-DS-strategy}/memory/communication-style-author.md (additive-only)
+#   S1 = ${IWE_GOVERNANCE_REPO:-DS-strategy}/memory/communication-style-author.md (additive-only,
+#        только через личный диспетчер — доступен только автору с PACK-rhetoric)
+#   S2 = memory/communication-style-personal.md (additive-only, файл-fallback — WP-412 Ф13).
+#        Пользователь копирует memory/communication-style-personal-template.md под этим именем
+#        и заполняет; шаблон-образец сам хук не читает никогда.
 #   Доставка = этот хук (UserPromptSubmit). Генерируемые файлы не трогаются.
 #
 # Поведение (density-based reinjection, peer-session 2026-06-08-23):
@@ -94,6 +98,21 @@ if [ -z "${FRAGMENT:-}" ] && [ -f "$S0_CORE" ]; then
 fi
 
 [ -n "${FRAGMENT:-}" ] || { echo '{}'; exit 0; }   # оба источника пусты/упали → пропуск (safe)
+
+# S2: личный оверрайд пользователя шаблона (WP-412 Ф13). Отдельный файл от
+# шаблона-образца (communication-style-personal-template.md) — его хук
+# никогда не читает, иначе placeholder-инструкция попала бы в промпт как
+# «стиль пользователя» на каждой чистой установке. Пусто/нет файла → просто
+# не добавляем, FRAGMENT остаётся как был (additive-only, не блокирует S0).
+PERSONAL_OVERRIDE="$PROJECT_DIR/memory/communication-style-personal.md"
+if [ -f "$PERSONAL_OVERRIDE" ]; then
+  PERSONAL_FRAGMENT=$(awk '/^---/{n++; if(n==2){found=1; next}} found' "$PERSONAL_OVERRIDE" 2>/dev/null)
+  if [ -n "${PERSONAL_FRAGMENT//[$' \t\n']/}" ]; then
+    FRAGMENT="$FRAGMENT
+
+$PERSONAL_FRAGMENT"
+  fi
+fi
 
 CONTEXT="## 🗣 Разговорный стиль IWE (S0 база + S1 автор) — применять при ответе человеку
 

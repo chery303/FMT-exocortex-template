@@ -89,7 +89,7 @@ validate_dayplan() { # <staged-path> <tmpfile>
         fi
     fi
 
-    if ! grep -qE "~[0-9]+\.?[0-9]*x" "$f" && ! grep -qiE "мультипликатор.*(не считаю|не наст)" "$f"; then
+    if ! grep -qE "~[0-9]+[.,]?[0-9]*x" "$f" && ! grep -qiE "мультипликатор.*(не считаю|не наст)" "$f"; then
         err "DayPlan $rel: мультипликатор не найден — нужен '~N.Nx' в строке бюджета или явная оговорка «мультипликатор не считаю»"
     fi
 
@@ -146,7 +146,7 @@ sys.exit(0 if d.get('mandatory_daily_wps') else 1)
         fi
     fi
 
-    if ! grep -qE "~[0-9]+\.?[0-9]* ?[hч] РП" "$f"; then
+    if ! grep -qE "~[0-9]+[.,]?[0-9]* ?[hч] РП" "$f"; then
         err "DayPlan $rel: бюджет дня не в формате '~Xч РП / ~Yч физ'"
     fi
 

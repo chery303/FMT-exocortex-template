@@ -23,7 +23,7 @@ routing:
 
 Day Close = протокол. Блокирующее требование — наблюдаемое свойство: **ни один шаг не пропущен молча**; каждый шаг отмечается ДО перехода к следующему.
 **Шаг 0 — ПЕРВОЕ действие:** зафиксировать список шагов прямо сейчас (до любых других действий) — в TodoWrite, а при его недоступности явной нумерацией в ответе.
-Инструмент по умолчанию — TodoWrite: каждый шаг алгоритма → отдельная задача (pending → in_progress → completed). **TodoWrite недоступен** (штатная ситуация, зависит от сборки клиента) → сообщить пилоту одной строкой, вести шаги явной нумерацией («Шаг X из Y: <название> — выполнен»), факт замены зафиксировать в отчёте закрытия (issues #561, #563).
+Инструмент по умолчанию — TodoWrite: каждый шаг алгоритма → отдельная задача (pending → in_progress → completed). **TodoWrite недоступен** (на моделях новее Sonnet 4.6 клиент по умолчанию не выдаёт этот инструмент — включается переменной `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` в `env` настроек, issue #1216) → сообщить пилоту одной строкой, вести шаги явной нумерацией («Шаг X из Y: <название> — выполнен»), факт замены зафиксировать в отчёте закрытия (issues #561, #563).
 Переход к следующему — ТОЛЬКО после отметки текущего. Шаг невозможен → blocked (не пропускать молча).
 
 ## Алгоритм
@@ -32,7 +32,7 @@ Day Close = протокол. Блокирующее требование — н
 `bash .claude/scripts/load-extensions.sh day-close before` → exit 0: `Read` каждый файл из вывода (alphabetic) → выполнить как первые шаги. Exit 1/3 (нет совпадений / нет каталога `extensions/` — штатно для новой установки, либо каталог повреждён) → пропустить молча. Поддерживает `extensions/day-close.before.md` И `extensions/day-close.before.<suffix>.md`.
 
 ### 0б. Дайджест — token discipline (issue #234)
-`. "${IWE_PATHS_FILE:-$HOME/.iwe-paths}" 2>/dev/null; bash "$IWE_SCRIPTS/day-close-prepare.sh"` — источник переменных явный (issue #688: верхнеуровневый Bash-вызов не проходит `.bashrc`/`.zshenv`/`BASH_ENV`, `$IWE_SCRIPTS` может быть пуст без явного `.`), один вызов вместо ~10 скан-запросов. Пронумерованные секции дайджеста ЗАМЕНЯЮТ скан-команды внутри шагов ниже (сами шаги исполняются — но берут данные из дайджеста, не перезапускают сканы): §1→шаг 1, §2→10b, §3→2d, §4→4б, §5→4в, §6→4, §7→6, §8→6 (prerequisite), §9-10→3, §11→2f. Реагировать только на flagged-пункты; drift-хит, который реально «ждёт X», — не drift. Скрипт отсутствует → legacy: inline-команды шагов.
+`IWE_PATHS="${IWE_PATHS_FILE:-}"; if [ -z "$IWE_PATHS" ]; then for _c in "$PWD/.iwe-paths" "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths" "$HOME/.iwe-paths"; do [ -r "$_c" ] && { IWE_PATHS="$_c"; break; }; done; fi; [ -n "$IWE_PATHS" ] && . "$IWE_PATHS" 2>/dev/null; bash "$IWE_SCRIPTS/day-close-prepare.sh"` — источник переменных явный (issue #688: верхнеуровневый Bash-вызов не проходит `.bashrc`/`.zshenv`/`BASH_ENV`, `$IWE_SCRIPTS` может быть пуст без явного `.`), один вызов вместо ~10 скан-запросов. Пронумерованные секции дайджеста ЗАМЕНЯЮТ скан-команды внутри шагов ниже (сами шаги исполняются — но берут данные из дайджеста, не перезапускают сканы): §1→шаг 1, §2→10b, §3→2d, §4→4б, §5→4в, §6→4, §7→6, §8→6 (prerequisite), §9-10→3, §11→2f. Реагировать только на flagged-пункты; drift-хит, который реально «ждёт X», — не drift. Скрипт отсутствует → legacy: inline-команды шагов.
 **Субагентное исполнение (рекомендуется при большой сессии дня):** родитель выполняет только дайджест → диспетчеризацию → согласование (шаг 8) → верификацию; шаги 1-7 исполняет ОДИН general-purpose субагент (sonnet, context isolation) с дайджестом в промпте, шаги 9-10b — субагент-финализатор с `day-close-prepare.sh --verify` вместо inline-grep 9a/9b; шаг 11 (R23) диспетчеризует родитель — субагент не может звать субагентов. Fallback: Agent tool недоступен / субагент упал дважды → исполнять inline, всё равно с дайджестом.
 <!-- Детали фаз: day-close-details.md § Шаг 0б -->
 
@@ -65,20 +65,20 @@ Day Close = протокол. Блокирующее требование — н
 
 ### 4б. Memory Drift Scan
 Две независимые проверки (issue #326 — лексическая одна пропускала расхождения статуса без триггерных слов):
-1. **Структурная:** `. "${IWE_PATHS_FILE:-$HOME/.iwe-paths}" 2>/dev/null; T="${IWE_TEMPLATE:-$HOME/IWE/FMT-exocortex-template}"; PY3="$(bash "$T/.claude/lib/find-python3.sh")" && "$PY3" "$T/.claude/scripts/memory-drift-scan.py"` — сверяет колонку «Статус» MEMORY.md с полем `status` WP-context по номеру РП. Exit 1 → для каждой найденной строки обновить устаревшее.
+1. **Структурная:** `IWE_PATHS="${IWE_PATHS_FILE:-}"; if [ -z "$IWE_PATHS" ]; then for _c in "$PWD/.iwe-paths" "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths" "$HOME/.iwe-paths"; do [ -r "$_c" ] && { IWE_PATHS="$_c"; break; }; done; fi; [ -n "$IWE_PATHS" ] && . "$IWE_PATHS" 2>/dev/null; T="${IWE_TEMPLATE:-$HOME/IWE/FMT-exocortex-template}"; PY3="$(bash "$T/.claude/lib/find-python3.sh")" && "$PY3" "$T/.claude/scripts/memory-drift-scan.py"` — сверяет колонку «Статус» MEMORY.md с полем `status` WP-context по номеру РП. Exit 1 → для каждой найденной строки обновить устаревшее.
 2. **Лексическая:** Grep MEMORY.md на паттерны «ждёт/блокер/blocked/остановлен» (ловит текстовые блокеры без изменения статуса — отдельный класс, скрипт п.1 их не видит). Для каждого: найти WP-context, проверить статус, обновить устаревшее.
 Анонс при 0 расхождений по обеим проверкам: *«Drift-scan: N паттернов + M структурных, устаревших нет»*.
 <!-- Детали: day-close-details.md § Шаг 4б -->
 
 ### 4в. Index Health Check
-`. "${IWE_PATHS_FILE:-$HOME/.iwe-paths}" 2>/dev/null; T="${IWE_TEMPLATE:-$HOME/IWE/FMT-exocortex-template}"; PY3="$(bash "$T/.claude/lib/find-python3.sh")" && "$PY3" "$T/.claude/scripts/check-index-health.py"` — для каждого FAIL/WARN: диагностика (дамп vs жанр) → перенести или пометить skip.
+`IWE_PATHS="${IWE_PATHS_FILE:-}"; if [ -z "$IWE_PATHS" ]; then for _c in "$PWD/.iwe-paths" "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths" "$HOME/.iwe-paths"; do [ -r "$_c" ] && { IWE_PATHS="$_c"; break; }; done; fi; [ -n "$IWE_PATHS" ] && . "$IWE_PATHS" 2>/dev/null; T="${IWE_TEMPLATE:-$HOME/IWE/FMT-exocortex-template}"; PY3="$(bash "$T/.claude/lib/find-python3.sh")" && "$PY3" "$T/.claude/scripts/check-index-health.py"` — для каждого FAIL/WARN: диагностика (дамп vs жанр) → перенести или пометить skip.
 <!-- Детали: day-close-details.md § Шаг 4в -->
 
 ### 4. Lesson Hygiene
 Просмотреть «Уроки» в MEMORY.md. Не применялся >1 нед и есть в `lessons_*.md` → удалить. Новый урок → строка в MEMORY.md + `lessons_*.md`. Цель: ≤8 уроков.
 
 ### 5. Автоматические шаги
-`. "${IWE_PATHS_FILE:-$HOME/.iwe-paths}" 2>/dev/null; "$IWE_SCRIPTS/day-close.sh"` — источник переменных явный (issue #688, см. шаг 0б), Linear sync, backup (memory/ + CLAUDE.md), reindex, консолидация сессий дня. Обновление платформы (`update.sh`) сюда НЕ входит (issue #945): это сетевая операция со своим ритуалом; о доступном обновлении сообщает таблица состояния IWE при Day Open (`update.sh --check --fast`), применяется отдельно (`/iwe-update`).
+`IWE_PATHS="${IWE_PATHS_FILE:-}"; if [ -z "$IWE_PATHS" ]; then for _c in "$PWD/.iwe-paths" "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths" "$HOME/.iwe-paths"; do [ -r "$_c" ] && { IWE_PATHS="$_c"; break; }; done; fi; [ -n "$IWE_PATHS" ] && . "$IWE_PATHS" 2>/dev/null; "$IWE_SCRIPTS/day-close.sh"` — источник переменных явный (issue #688, см. шаг 0б), Linear sync, backup (memory/ + CLAUDE.md), reindex, консолидация сессий дня. Обновление платформы (`update.sh`) сюда НЕ входит (issue #945): это сетевая операция со своим ритуалом; о доступном обновлении сообщает таблица состояния IWE при Day Open (`update.sh --check --fast`), применяется отдельно (`/iwe-update`).
 
 ### 6. Мультипликатор IWE
 > Условный шаг: если `params.yaml → multiplier_enabled: false` → пропустить и

@@ -81,7 +81,9 @@ fi
 # run_inbox_check_isolated().
 assert_ai_cli_root_compat() {  # <flags>
     local flags="${1:-}"
-    local uid="${EUID:-$(id -u)}"
+    # IWE_EXTRACTOR_TEST_EUID: test-only override (EUID is bash-readonly, so a
+    # test harness cannot simulate root without it); unset in every real run.
+    local uid="${IWE_EXTRACTOR_TEST_EUID:-${EUID:-$(id -u)}}"
     [ "$uid" -eq 0 ] || return 0
     if printf '%s\n' "$flags" | grep -Eq '(^|[[:space:]])--dangerously-skip-permissions([[:space:]]|$)'; then
         echo "[$(date '+%H:%M:%S')] ERROR: запуск от root несовместим с --dangerously-skip-permissions (AI CLI откажет на каждом вызове). Снимите флаг (AI_CLI_EXTRA_FLAGS/IWE_EXTRACTOR_INBOX_AI_FLAGS) или запускайте не от root." >&2

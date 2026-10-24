@@ -10,6 +10,7 @@
 #
 # Usage:
 #   ds-publish.sh <repo-dir> <priority> [--reason TEXT] [--from-commit SHA] [--branch NAME]
+#                 [--exact-commit SHA] [--run-id ID]
 #     <priority>      normal | high (kept for the callers' contract; not used to reorder anything)
 #     --reason TEXT   shown in the output only
 #     --from-commit   the single commit to publish (default: HEAD of <repo-dir>)
@@ -17,6 +18,12 @@
 #                     copy (a worktree on a local-only branch such as strategist/<scenario>-<id>
 #                     or session-isolate/<agent>-<session>) passes the branch it was created
 #                     from: origin has no branch named after the copy.
+#     --exact-commit  issue #1230: lib/publish-gate.sh::publish_commit() always passes this
+#                     with the same value as --from-commit (this script only ever publishes
+#                     one commit, never a range) -- accepted and asserted equal, never changes
+#                     behaviour. A mismatch means the caller's contract drifted; fail loud.
+#     --run-id ID     issue #1230: correlates one run's messages in the notification queue;
+#                     shown in the output, not otherwise used by this script.
 #
 # Behaviour:
 #   - target branch = --branch NAME when given; otherwise the branch currently checked out in
@@ -42,7 +49,7 @@ MAX_ATTEMPTS=3
 die() { echo "ds-publish: $1" >&2; exit "${2:-1}"; }
 
 usage() {
-  echo "usage: ds-publish.sh <repo-dir> <priority: normal|high> [--reason TEXT] [--from-commit SHA] [--branch NAME]" >&2
+  echo "usage: ds-publish.sh <repo-dir> <priority: normal|high> [--reason TEXT] [--from-commit SHA] [--branch NAME] [--exact-commit SHA] [--run-id ID]" >&2
   exit 1
 }
 
@@ -57,11 +64,13 @@ is_branch_name() {
 REPO="$1"; PRIORITY="$2"; shift 2
 case "$PRIORITY" in normal|high) ;; *) usage ;; esac
 
-REASON=""; FROM_COMMIT=""; TARGET_BRANCH=""
+REASON=""; FROM_COMMIT=""; TARGET_BRANCH=""; EXACT_COMMIT=""; RUN_ID=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --reason)      [ "$#" -ge 2 ] || usage; REASON="$2"; shift 2 ;;
-    --from-commit) [ "$#" -ge 2 ] || usage; FROM_COMMIT="$2"; shift 2 ;;
+    --reason)       [ "$#" -ge 2 ] || usage; REASON="$2"; shift 2 ;;
+    --from-commit)  [ "$#" -ge 2 ] || usage; FROM_COMMIT="$2"; shift 2 ;;
+    --exact-commit) [ "$#" -ge 2 ] || usage; EXACT_COMMIT="$2"; shift 2 ;;
+    --run-id)       [ "$#" -ge 2 ] || usage; RUN_ID="$2"; shift 2 ;;
     --branch)
       [ "$#" -ge 2 ] || usage
       is_branch_name "$2" || { echo "ds-publish: --branch: not a branch name: '$2'" >&2; usage; }
@@ -76,6 +85,15 @@ git -C "$REPO" remote get-url origin >/dev/null 2>&1 || die "$REPO has no remote
 SHA=$(git -C "$REPO" rev-parse --verify --quiet "${FROM_COMMIT:-HEAD}^{commit}") \
   || die "commit '${FROM_COMMIT:-HEAD}' not found in $REPO"
 
+# --exact-commit never carries different information than --from-commit today (this script
+# only ever replays one commit); a mismatch means publish-gate.sh's contract drifted.
+if [ -n "$EXACT_COMMIT" ]; then
+  EXACT_SHA=$(git -C "$REPO" rev-parse --verify --quiet "${EXACT_COMMIT}^{commit}") \
+    || die "--exact-commit: commit '$EXACT_COMMIT' not found in $REPO"
+  [ "$EXACT_SHA" = "$SHA" ] \
+    || die "--exact-commit ($EXACT_SHA) does not match --from-commit ($SHA)"
+fi
+
 if [ "$(git -C "$REPO" rev-list --parents -n 1 "$SHA" | wc -w | tr -d ' ')" -gt 2 ]; then
   die "$SHA is a merge commit; only single commits are published" 2
 fi
@@ -88,7 +106,7 @@ else
   BRANCH="${BRANCH:-main}"
 fi
 
-echo "ds-publish: ${SHA:0:12} -> origin/$BRANCH${REASON:+ ($REASON)}"
+echo "ds-publish: ${SHA:0:12} -> origin/$BRANCH${REASON:+ ($REASON)}${RUN_ID:+ [run=$RUN_ID]}"
 
 WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ds-publish.XXXXXX" 2>/dev/null || mktemp -d) || die "cannot create a temp directory"
 WORKTREE="$WORK_ROOT/wt"

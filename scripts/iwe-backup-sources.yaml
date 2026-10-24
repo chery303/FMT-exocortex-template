@@ -1,0 +1,97 @@
+# iwe-backup-sources.yaml — дефолты источников бэкапа вне ${HOME}/IWE
+#
+# WP-7 Ф233а, 2026-10-16 (пир-сессия 2026-10-16-18-iwe-template-backup,
+# Claude+Kimi+Codex, round-loop, consensus reached).
+#
+# Проблема: единственный существующий механизм (backup-icloud.sh) покрывает
+# только ${HOME}/IWE. Runtime-каталоги ИИ-агентов (память, история диалогов,
+# конфиги) лежат вне IWE и ничем не защищены — найдено на инциденте потери
+# ~/.claude/logs/style-violations.log без возможности восстановить примеры
+# нарушений.
+#
+# Классификация по ВОССТАНОВИМОСТИ, не по расположению (находка пир-сессии:
+# деление "logs=восстановимо" было неверным — конкретный инцидент прямо его
+# опровергает). Три уровня:
+#
+#   tier0_unique       — уникальные данные, нет второй копии где-либо.
+#                         Бэкапить ВСЕГДА, с первой фазы реализации.
+#   tier1_scheduled     — восстановимо с усилием (время/ручная работа), но
+#                         не автоматически. Бэкапить по расписанию.
+#   tier2_optional      — воспроизводимо автоматически (переустановка,
+#                         повторная загрузка) или малоценно. Бэкапить
+#                         опционально, по явному включению пользователем.
+#
+# Новый, неизвестный скрипту runtime-подкаталог ПО УМОЛЧАНИЮ включается в
+# tier1 с пометкой unknown=true — не исключается молчаливо (решение
+# пир-сессии: "по умолчанию включать и сигнализировать о росте, не
+# молчаливо исключать").
+#
+# Локальный override пользователя: ${HOME}/.iwe-backup-sources.local.yaml —
+# этот файл НЕ трогается обновлением шаблона (update.sh). Значения оттуда
+# дополняют (не заменяют) дефолты ниже; формат override — та же схема.
+
+schema_version: 1
+
+tier0_unique:
+  # ~/IWE — единственный путь, который ДОЛЖЕН существовать у любого
+  # пользователя шаблона; остальные — опциональны по факту установки
+  # конкретных агентов.
+  - path: "${HOME}/IWE"
+    agent: "core"
+    note: "рабочее дерево платформы — git-репозитории включаются ЦЕЛИКОМ, включая .git/ (пир-сессия отозвала исключение .git: непушнутые коммиты/stash/локальные ветки не восстановимы из remote)"
+  - path: "${HOME}/.claude/projects"
+    agent: "claude"
+    note: "auto-memory (включает MEMORY.md) и полные стенограммы — невосстановимо"
+  - path: "${HOME}/.claude.json"
+    agent: "claude"
+    note: "глобальный конфиг Claude Code (OAuth-токены, project history)"
+  - path: "${HOME}/.codex/config.toml"
+    agent: "codex"
+    note: "конфиг Codex"
+  - path: "${HOME}/.gitconfig"
+    agent: "core"
+    note: "git identity + signing key reference"
+  - path: "${HOME}/.git-credentials"
+    agent: "core"
+    note: "HTTPS git-токены, если credential helper = store"
+
+tier1_scheduled:
+  - path: "${HOME}/.claude/logs"
+    agent: "claude"
+    note: "логи с фактурой (инцидент-триггер этой фазы: style-violations.log)"
+  - path: "${HOME}/.claude/state"
+    agent: "claude"
+  - path: "${HOME}/.codex"
+    agent: "codex"
+    note: "весь каталог Codex, кроме уже перечисленного в tier0"
+  - path: "${HOME}/.hermes"
+    agent: "hermes"
+  - path: "${HOME}/.kimi"
+    agent: "kimi"
+  - path: "${HOME}/.kimi-code"
+    agent: "kimi"
+  - path: "${HOME}/.grok"
+    agent: "grok"
+  - path: "${HOME}/.zshrc"
+    agent: "core"
+  - path: "${HOME}/.bash_profile"
+    agent: "core"
+
+tier2_optional:
+  - path: "${HOME}/.claude/file-history"
+    agent: "claude"
+    note: "история правок редактора — большая по объёму, частично восстановима из git"
+  - path: "${HOME}/.vscode"
+    agent: "core"
+    note: "расширения VS Code — восстановимы переустановкой"
+
+# Known-but-excluded — НЕ бэкапим и не предупреждаем об отсутствии (SSH/GPG/
+# Keychain). Отдельный follow-up (Ф233д): собственный защищённый механизм,
+# не общий tar/restic-снэпшот без доп. защиты приватных ключей.
+known_excluded:
+  - path: "${HOME}/.ssh"
+    reason: "приватные ключи — отдельный защищённый механизм (Ф233д), не этот конвейер"
+  - path: "${HOME}/.gnupg"
+    reason: "GPG-ключи — отдельный защищённый механизм (Ф233д), не этот конвейер"
+  - path: "macOS Keychain"
+    reason: "системное хранилище, не файл — вне скоупа файлового бэкапа, документируется как известное ограничение"

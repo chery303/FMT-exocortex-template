@@ -12,7 +12,8 @@
 #   --force                 перезаписать НЕпустую memory/ (по умолчанию — отказ)
 #   --dry-run               показать что будет сделано, без изменений
 #
-# Источник: exocortex/ (наполняется day-close.sh --backup и хуком memory-exocortex-sync.sh).
+# Источник: последний завершённый Day Close из .iwe-runtime/day-close-backups,
+# если он есть; иначе прежний exocortex/ канонического репозитория.
 # Path-схема идентична scripts/day-close.sh (v0.35.2): HOME_SLUG + override через env.
 
 set -euo pipefail
@@ -38,6 +39,28 @@ WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/IWE}"
 GOVERNANCE_REPO="${GOVERNANCE_REPO:-${IWE_GOVERNANCE_REPO:-DS-strategy}}"
 DS_STRATEGY="${GOV_ARG:-$WORKSPACE_DIR/$GOVERNANCE_REPO}"
 EXOCORTEX_SRC="$DS_STRATEGY/exocortex"
+BACKUP_SELECTED=false
+if [ -z "$GOV_ARG" ]; then
+    BACKUP_ROOT="$WORKSPACE_DIR/.iwe-runtime/day-close-backups"
+    BACKUP_POINTER="$BACKUP_ROOT/latest"
+    if [ -e "$BACKUP_POINTER" ] || [ -L "$BACKUP_POINTER" ]; then
+        if [ -L "$BACKUP_ROOT" ] || [ -L "$BACKUP_POINTER" ] || [ ! -f "$BACKUP_POINTER" ]; then
+            echo "Некорректный указатель на резервную копию: $BACKUP_POINTER" >&2
+            exit 1
+        fi
+        IWE_BACKUP_NAME=$(cat "$BACKUP_POINTER") || exit 1
+        if [[ ! "$IWE_BACKUP_NAME" =~ ^day-close-[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]]; then
+            echo "Некорректное имя резервной копии в $BACKUP_POINTER" >&2
+            exit 1
+        fi
+        EXOCORTEX_SRC="$BACKUP_ROOT/$IWE_BACKUP_NAME/exocortex"
+        if [ -L "$BACKUP_ROOT/$IWE_BACKUP_NAME" ] || [ -L "$EXOCORTEX_SRC" ] || [ ! -d "$EXOCORTEX_SRC" ]; then
+            echo "Последняя резервная копия недоступна: $EXOCORTEX_SRC" >&2
+            exit 1
+        fi
+        BACKUP_SELECTED=true
+    fi
+fi
 # Claude Code слугифицирует путь проекта, заменяя на '-' не только '/', но и '_' и '.'.
 # Если в $HOME есть '_' (напр. username john_doe), реальная папка — '-home-john-doe-IWE'.
 # tr '/' '-' дал бы фантом '-home-john_doe-IWE' → restore промахнётся мимо auto-memory.
@@ -218,6 +241,13 @@ if [ ! -d "$EXOCORTEX_SRC" ]; then
     err "exocortex не найден: $EXOCORTEX_SRC"
     err "Укажи путь к governance-репо: restore-from-exocortex.sh <path>"
     exit 1
+fi
+if $BACKUP_SELECTED; then
+    BACKUP_LINK=$(find "$EXOCORTEX_SRC" -type l -print -quit) || exit 1
+    if [ -n "$BACKUP_LINK" ]; then
+        err "Последняя резервная копия содержит симлинк: $BACKUP_LINK"
+        exit 1
+    fi
 fi
 
 if [ -z "$RESTORE_STDLIB_PYTHON3" ]; then

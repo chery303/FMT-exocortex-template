@@ -802,9 +802,15 @@ run_claude() {
     # as before this issue -- common.sh missing (old install) must still
     # give the exact old hardcoded model, not fall through to the bare CLI
     # default below.
+    # WP-577 Ф3 (2026-10-14): claude-opus-4-7 was disabled org-wide ("403 Model
+    # 'claude-opus-4-7' is disabled. Use a non-Opus model.") -- found live on
+    # a deployed copy of this file, where it silenced week-review (fails in
+    # 3s, every Monday, forever) for weeks. Every new install carries the
+    # same dead default. Moved to the model already proven working here for
+    # the neighboring scenarios.
     local _scenario_default=""
     case "$command_file" in
-        week-review) _scenario_default="claude-opus-4-7" ;;
+        week-review) _scenario_default="claude-sonnet-4-6" ;;
         session-prep|day-plan|day-close) _scenario_default="claude-sonnet-4-6" ;;
         note-review) _scenario_default="claude-haiku-4-5-20251001" ;;
     esac

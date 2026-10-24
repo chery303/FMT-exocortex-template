@@ -9,15 +9,20 @@
 #   Триггер: первое за сессию касание пути под ~/IWE/<repo> любым из инструментов
 #            Read | Write | Edit | MultiEdit | NotebookEdit | Bash.
 #   Вход:    stdin JSON {tool_name, tool_input, session_id}.
-#   Действие: git -C <repo> pull --rebase — один раз на репо на сессию.
-#   Отказы:  НИКОГДА не блокирует (exit 0 всегда). Грязное дерево / сетевой сбой / конфликт rebase
-#            → pull пропущен, в additionalContext пометка "данные potentially stale".
+#   Действие: классификация read-only (scripts/lib/git-sync-status.sh, ls-remote,
+#             никогда не трогает stash/rebase/refs) + на заведомо чистом дереве —
+#             атомарный `git merge --ff-only` — один раз на репо на сессию.
+#             НИКОГДА не делает autostash: issue #1245 (16.10.2026, рецидив
+#             bug-2026-07-17) — конфликт при возврате стеша тихо топил несохранённые
+#             правки, предупреждение было видно только в additionalContext одной сессии.
+#   Отказы:  НИКОГДА не блокирует (exit 0 всегда). Грязное дерево / сетевой сбой / история
+#            разошлась → подтяжка пропущена, в additionalContext пометка "данные potentially stale".
 #   Состояние: ~/.claude/state/repo-pulled-<session>.txt (одно имя репо на строку).
 
 set -uo pipefail
 
 [[ "${1:-}" == "--help" ]] && {
-    echo "pull-on-touch.sh — lazy 'git pull --rebase' on first repo touch per session (CLAUDE.md §2 п.5)"
+    echo "pull-on-touch.sh — lazy read-only freshness check + safe ff-only fast-forward on first repo touch per session (CLAUDE.md §2 п.5)"
     exit 0
 }
 
@@ -60,6 +65,10 @@ print("\n".join(out))
 TO=""
 command -v timeout >/dev/null 2>&1 && TO="timeout 20"
 
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../scripts/lib/git-sync-status.sh
+. "$HOOK_DIR/../../scripts/lib/git-sync-status.sh"
+
 warns=""
 pulled=""
 while IFS= read -r repo; do
@@ -68,23 +77,42 @@ while IFS= read -r repo; do
     echo "$repo" >> "$STATE_FILE"                  # пометить ДО pull (lazy: одна попытка на сессию)
 
     dir="$IWE_ROOT/$repo"
+    branch=$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null)
 
-    # autostash тянет даже на грязном дереве (прячет правки → rebase → возвращает),
-    # поэтому пропуска-на-грязном нет. Считаем стэши до/после, чтобы поймать
-    # незавершённый возврат при конфликте и НЕ потерять локальную работу молча.
-    stash_before=$(git -C "$dir" stash list 2>/dev/null | wc -l | tr -d ' ')
-
-    if out=$($TO git -C "$dir" pull --rebase --autostash --quiet 2>&1); then
-        [ -n "$out" ] && pulled="${pulled}${repo} "
-    else
-        git -C "$dir" rebase --abort >/dev/null 2>&1 || true   # вернуть репо в исходное состояние
-        warns="${warns}${repo}: подтяжка не удалась (сеть/конфликт), данные potentially stale. "
+    # Больше никогда не стешит (issue #1245, рецидив bug-2026-07-17): autostash
+    # мог конфликтовать на возврате и тихо топить несохранённые правки — в stash,
+    # с предупреждением, видимым только в additionalContext этого тул-колла.
+    # Теперь: грязное дерево (tracked ИЛИ untracked) — вообще не трогаем репо,
+    # чтобы не рисковать локальной работой. Чистое дерево — классифицируем
+    # read-only (ls-remote, та же библиотека, что Sync Gate) и продвигаем ветку
+    # только атомарным `merge --ff-only`: он либо чисто продвигает HEAD, либо
+    # отказывает без побочных эффектов — промежуточного состояния не существует.
+    if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+        warns="${warns}${repo}: есть несохранённые правки, свежее с origin не подтягиваю (чтобы не рисковать ими), данные potentially stale. "
+        continue
     fi
 
-    stash_after=$(git -C "$dir" stash list 2>/dev/null | wc -l | tr -d ' ')
-    if [ "${stash_after:-0}" -gt "${stash_before:-0}" ]; then
-        warns="${warns}${repo}: локальные правки не вернулись автоматически (конфликт), лежат в git stash — верни вручную (git -C $dir stash pop). "
-    fi
+    check_git_sync_status "$dir" "$branch" 20
+    case "$GIT_SYNC_STATUS" in
+        OK)
+            ;;
+        STALE)
+            # Single-ref fetch, not the library's "never fetch" guarantee: we
+            # need the new commit object locally before `merge --ff-only` can
+            # use it. Narrower than a full fetch, and `&&`-gated — a concurrent
+            # session's lock on the same ref surfaces as the warning below,
+            # not as a partial state.
+            if $TO git -C "$dir" fetch --quiet origin "$branch" 2>/dev/null \
+                && git -C "$dir" merge --ff-only --quiet "origin/$branch" 2>/dev/null; then
+                pulled="${pulled}${repo} "
+            else
+                warns="${warns}${repo}: подтяжка не удалась (сеть/конфликт при обновлении ветки), данные potentially stale. "
+            fi
+            ;;
+        *)
+            warns="${warns}${repo}: подтяжка не удалась ($GIT_SYNC_STATUS), данные potentially stale. "
+            ;;
+    esac
 done <<< "$REPOS"
 
 # Сообщить агенту только если есть что сказать (свежие данные или пометка stale).

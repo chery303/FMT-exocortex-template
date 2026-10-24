@@ -564,9 +564,40 @@ if [ "$TOOL_NAME" = "Bash" ]; then
     # even exists) — scoped ONLY to issue #784/#785's whitelist, not to the
     # pre-existing static markers (__WL_DAY_CLOSE_PREPARE__ etc. below),
     # which are a separate, already-shipped finding outside this fix's scope.
+    #
+    # issue #1238: #1233's new .iwe-paths resolver (day-close/SKILL.md,
+    # dry-run-contract.md) is a compound statement ("IWE_PATHS=...; if ...;
+    # then for _c in ...; do ...; done; fi; [ -n ... ] && . \"$IWE_PATHS\""),
+    # not a single quoted argument like the two __WL_IWE_PATHS_* patterns
+    # above -- its final dot-source targets the *variable* $IWE_PATHS, whose
+    # value the per-segment classifier below can't see (each segment is
+    # classified independently; it has no memory of what an earlier segment
+    # assigned). Splitting the chain and whitelisting only the trailing
+    # `. "$IWE_PATHS"` segment would need taint-tracking PWD/IWE_WORKSPACE
+    # reassignment too -- and IWE_PATHS itself is legitimately assigned
+    # *twice* inside this very chain, so a blanket "IWE_PATHS= anywhere ->
+    # tampered" rule (the HOME_OR_IWE_PATHS_TAMPERED technique) would flag
+    # our own whitelisted text and never fire. The chain is whitelisted as
+    # ONE exact, pre-approved block instead: this pattern matches character-
+    # for-character only the known-safe text (verified both ends -- see
+    # scripts/tests/ test for this hook, which asserts the exact byte match,
+    # not just a smoke pass/fail), so there is no sub-pattern an attacker
+    # could reuse out of context. A single added/removed space anywhere in
+    # the chain fails the match and the whole command falls through to
+    # "indirect execution under dry-run" (fail-closed), same as any other
+    # unrecognized source|. target.
+    #
+    # Must run FIRST in this -e pipeline, before the standalone
+    # "$HOME/.iwe-paths" marker below: the chain's own last fallback
+    # candidate is that exact literal, so if the standalone marker ran
+    # first it would eat that substring out of the chain and the whole-
+    # block pattern below would never match the (now-mutated) text. Found
+    # live while adding this fix -- the two earlier tests in
+    # TestIwePathsChainWhitelist failed with the block pattern listed last.
     GATE_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     [ -n "$GATE_NONCE" ] || GATE_NONCE="$$-$(date +%s%N 2>/dev/null || date +%s)"
     NORM=$(printf '%s' "$CMD" | sed -E \
+        -e "s@IWE_PATHS=\"\\\$\\{IWE_PATHS_FILE:-\\}\"; if \\[ -z \"\\\$IWE_PATHS\" \\]; then for _c in \"\\\$PWD/\\.iwe-paths\" \"\\\$\\{IWE_WORKSPACE:-\\\$HOME/IWE\\}/\\.iwe-paths\" \"\\\$HOME/\\.iwe-paths\"; do \\[ -r \"\\\$_c\" \\] && \\{ IWE_PATHS=\"\\\$_c\"; break; \\}; done; fi; \\[ -n \"\\\$IWE_PATHS\" \\] && \\. \"\\\$IWE_PATHS\"@ __WL_IWE_PATHS_CHAIN_${GATE_NONCE}__ @g" \
         -e 's@"\$IWE_SCRIPTS/day-close-prepare\.sh"@ __WL_DAY_CLOSE_PREPARE__ @g' \
         -e 's@"\$IWE_SCRIPTS/dry-run-complete\.sh"@ __WL_DRY_RUN_COMPLETE__ @g' \
         -e "s@\\\$\\{IWE_TEMPLATE:-${WL_TEMPLATE_ABS//\//\\/}\\}/\\.claude/scripts/memory-drift-scan\\.py@ __WL_PY_MDS__ @g" \
@@ -600,6 +631,12 @@ if [ "$TOOL_NAME" = "Bash" ]; then
     # Шаг 2: разбить на простые команды.
     SPLIT=$(printf '%s\n' "$NORM" | sed -E 's/\$\(|`|[(){}&;]|\|\|?|&&/\n/g')
 
+    # issue #1258: same split, but from $CMD (before $NORM collapses every
+    # quoted span to the literal text "QSTR") -- a quoted/escaped command
+    # name like "cd" or \cd needs its quoting intact to tell it apart from
+    # QSTR by the time the cd/pushd check below runs.
+    SPLIT_RAW=$(printf '%s\n' "$CMD" | sed -E 's/\$\(|`|[(){}&;]|\|\|?|&&/\n/g')
+
     # Live-review finding (Fable, 2026-09-14): whitelist для .iwe-paths матчит
     # ЛИТЕРАЛЬНЫЙ ТЕКСТ "$HOME/.iwe-paths"/"${IWE_PATHS_FILE:-...}", а не
     # разрешённое значение — цикл ниже классифицирует каждый сегмент НЕЗАВИСИМО
@@ -618,12 +655,115 @@ if [ "$TOOL_NAME" = "Bash" ]; then
     # Регекс ниже покрывает все три класса; кавычные спаны уже схлопнуты в QSTR
     # к этому шагу (см. sed выше), поэтому "HOME=" внутри пользовательской
     # строки (напр. python -c "...HOME=...") сюда не протекает.
+    #
+    # issue #1238: IWE_WORKSPACE и PWD добавлены в этот же регекс — они теперь
+    # тоже управляют тем, какой файл реально сорсится (#1233 fallback-цепочка
+    # пробует "$PWD/.iwe-paths" и "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths"),
+    # той же атакой, что и HOME/IWE_PATHS_FILE изначально. Проверено живьём
+    # (не только по тексту): `PWD=/tmp/evil; echo "$PWD/.iwe-paths"` реально
+    # печатает `/tmp/evil/.iwe-paths` в bash — плоское присваивание переопределяет
+    # подстановку.
+    #
+    # Cold-review finding (Agent tool, 2026-10-15): `cd` — обычный, самый частый
+    # способ реально сменить `$PWD` в работающем шелле — НЕ ловился присваивание-
+    # ориентированным регексом выше (`cd` не матчит `VAR=`). Живой PoC подтвердил
+    # полный обход: `cd /tmp/evil-poc; <цепочка>` проходил гейт (exit 0) и реально
+    # сорсил подложный `/tmp/evil-poc/.iwe-paths` при настоящем исполнении.
+    # `pushd` даёт тот же эффект; `popd`/переход через функцию с другим именем —
+    # не покрыты, задокументированная остаточная граница (memory/dry-run-contract.md).
     HOME_OR_IWE_PATHS_TAMPERED=0
     if printf '%s\n' "$SPLIT" | grep -qE \
-        '(^|[[:space:]])(builtin[[:space:]]+|command[[:space:]]+)?(export|readonly|declare|typeset|local)([[:space:]]+-[A-Za-z]+)*[[:space:]]+(HOME|IWE_PATHS_FILE)=|(^|[[:space:]])(HOME|IWE_PATHS_FILE)=|(^|[[:space:]])printf([[:space:]]+[^[:space:]]*)*[[:space:]]+-v[[:space:]]+(HOME|IWE_PATHS_FILE)([[:space:]]|$)|(^|[[:space:]])read([[:space:]]+-[A-Za-z]+)*[[:space:]]+(HOME|IWE_PATHS_FILE)([[:space:]]|$)' \
+        '(^|[[:space:]])(builtin[[:space:]]+|command[[:space:]]+)?(export|readonly|declare|typeset|local)([[:space:]]+-[A-Za-z]+)*[[:space:]]+(HOME|IWE_PATHS_FILE|IWE_WORKSPACE|PWD)=|(^|[[:space:]])(HOME|IWE_PATHS_FILE|IWE_WORKSPACE|PWD)=|(^|[[:space:]])printf([[:space:]]+[^[:space:]]*)*[[:space:]]+-v[[:space:]]+(HOME|IWE_PATHS_FILE|IWE_WORKSPACE|PWD)([[:space:]]|$)|(^|[[:space:]])read([[:space:]]+-[A-Za-z]+)*[[:space:]]+(HOME|IWE_PATHS_FILE|IWE_WORKSPACE|PWD)([[:space:]]|$)' \
     ; then
         HOME_OR_IWE_PATHS_TAMPERED=1
     fi
+
+    # issue #1258 (independent red-team audit, 2026-10-17): the `cd|pushd`
+    # alternative the regex above used to carry only matched the literal
+    # bytes "cd"/"pushd" with real whitespace around them — exactly the PoC
+    # #1238 itself used, nothing else. `\cd`, `"cd"`, `'cd'` and `$'cd'` all
+    # strip down to the plain word "cd" once bash parses them and invoke the
+    # identical builtin (confirmed live: `bash -c '\cd /tmp/x && pwd'` really
+    # changes directory) — the same attack #1238 closed, just not written in
+    # the one byte-exact shape the regex looked for. A fifth regex
+    # alternative for "\cd" would only buy one more round of the same trap
+    # (quoted-cd, ansi-c $'cd', ...), so this reuses the word tokenizer
+    # destructive-guard.sh already has for its own `rm` detection — it strips
+    # quotes/backslash/ANSI-C escapes the way bash's own parser does, so a
+    # command name survives disguising by construction, not by one more
+    # enumerated case.
+    CD_PUSHD_TOKEN_DETECTED=0
+    if printf '%s\n' "$SPLIT_RAW" | perl -e '
+        sub words {
+          my ($text) = @_;
+          my (@out, $word, $quote) = ();
+          for (my $i = 0; $i < length($text); $i++) {
+            my $char = substr($text, $i, 1);
+            if (defined $quote) {
+              if ($char eq "\\" && $quote eq "ansi" && $i + 1 < length($text)) {
+                my $esc = substr($text, $i + 1, 1);
+                my $tail = substr($text, $i + 1);
+                my %simple = (a => "\a", b => "\b", e => chr(27), E => chr(27), f => "\f", n => "\n", r => "\r", t => "\t", v => chr(11));
+                if ($esc eq "x" && $tail =~ /^x([0-9A-Fa-f]{1,2})/) {
+                  $word .= chr(hex $1);
+                  $i += length($1) + 1;
+                } elsif ($tail =~ /^([0-7]{1,3})/) {
+                  $word .= chr(oct($1) & 255);
+                  $i += length($1);
+                } elsif (($esc eq "u" && $tail =~ /^u([0-9A-Fa-f]{1,4})/) || ($esc eq "U" && $tail =~ /^U([0-9A-Fa-f]{1,8})/)) {
+                  $word .= chr(hex $1);
+                  $i += length($1) + 1;
+                } elsif (exists $simple{$esc}) {
+                  $word .= $simple{$esc};
+                  $i++;
+                } elsif ($esc eq "c" && $i + 2 < length($text)) {
+                  $word .= chr(ord(substr($text, $i + 2, 1)) & 31);
+                  $i += 2;
+                } elsif ($esc eq chr(92) || $esc eq chr(39) || $esc eq q{"} || $esc eq q{?}) {
+                  $word .= $esc;
+                  $i++;
+                } else {
+                  $word .= $char;
+                }
+              } elsif ($char eq "\\" && $quote eq q{"} && $i + 1 < length($text) && substr($text, $i + 1, 1) =~ /[\$`"\\\n]/) {
+                $word .= substr($text, ++$i, 1);
+              } elsif ($char eq ($quote eq "ansi" ? chr(39) : $quote)) {
+                undef $quote;
+              } else {
+                $word .= $char;
+              }
+            } elsif ($char eq q{$} && $i + 1 < length($text) && substr($text, $i + 1, 1) eq chr(39)) {
+              $quote = "ansi";
+              $i++;
+            } elsif ($char eq q{$} && $i + 1 < length($text) && substr($text, $i + 1, 1) eq q{"}) {
+              next;
+            } elsif ($char eq q{"} || $char eq chr(39)) {
+              $quote = $char;
+            } elsif ($char eq "\\" && $i + 1 < length($text)) {
+              $word .= substr($text, ++$i, 1);
+            } elsif ($char =~ /\s/) {
+              push @out, $word if length $word;
+              $word = q{};
+            } else {
+              $word .= $char;
+            }
+          }
+          push @out, $word if length $word;
+          return @out;
+        }
+        while (my $seg = <STDIN>) {
+          chomp $seg;
+          my @w = words($seg);
+          next unless @w;
+          my $i = 0;
+          $i++ if $i < @w && ($w[$i] eq "builtin" || $w[$i] eq "command");
+          exit 0 if $i < @w && ($w[$i] eq "cd" || $w[$i] eq "pushd");
+        }
+        exit 1;
+    '; then
+        CD_PUSHD_TOKEN_DETECTED=1
+    fi
+    [ "$CD_PUSHD_TOKEN_DETECTED" = "1" ] && HOME_OR_IWE_PATHS_TAMPERED=1
 
     while IFS= read -r SEG; do
         [ -z "$SEG" ] && continue
@@ -750,6 +890,27 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                     scripts/dry-run-complete.sh|"$WL_ABS3"|__WL_DRY_RUN_COMPLETE__) ;;
                     *) block "$CMD (indirect execution under dry-run)" ;;
                 esac
+                ;;
+            "__WL_IWE_PATHS_CHAIN_${GATE_NONCE}__")
+                # issue #1238: whole-block marker from NORM above (see the
+                # comment on that sed -e line for why the #1233 fallback
+                # chain is whitelisted as ONE exact unit instead of per-
+                # segment). The marker IS the whole segment here -- no
+                # command word precedes it, unlike the source|. arm below,
+                # so this arm matches on W0 directly.
+                if [ "$HOME_OR_IWE_PATHS_TAMPERED" = "1" ]; then
+                    block "$CMD (HOME/IWE_PATHS_FILE/IWE_WORKSPACE/PWD reassigned earlier in the same command)"
+                fi
+                shift
+                # Same concatenation guard as the source|. arm's round-2
+                # cold-review fix below: NORM's replacement text has spaces
+                # on both sides of the marker, but sed's match itself has no
+                # end-of-string anchor -- text glued directly onto the
+                # matched literal with no separator (e.g. `...&& . "$IWE_PATHS"rm
+                # -rf /`) stays attached to the marker as extra tokens in
+                # this same segment. Any leftover token after the marker
+                # means the original text wasn't actually just our chain.
+                [ $# -gt 0 ] && block "$CMD (unexpected token after .iwe-paths chain whitelist marker)"
                 ;;
             source|.)
                 # issue #784/#785: сорсинг .iwe-paths (плоский KEY=VALUE

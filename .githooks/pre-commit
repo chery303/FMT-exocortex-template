@@ -233,7 +233,32 @@ fi
 # memory/, extensions/, update-manifest.json).
 STAGED_VALIDATOR_SCOPE=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null \
     | grep -E '^(roles/|\.claude/|setup/|memory/|extensions/|seed/|update-manifest\.json)' || true)
-if [ -n "$STAGED_VALIDATOR_SCOPE" ] && [ -x "setup/integration-contract-validator.sh" ]; then
+# issue #1234: setup/integration-contract-validator.sh is in update-manifest.json
+# excluded_paths (issue #1223) -- update.sh deliberately never ships it to forks,
+# the same reason validate-template.yml skips the jobs that need it via
+# `if: github.repository == 'TserenTserenov/FMT-exocortex-template'`. A fork's
+# working-tree copy of the script is a frozen leftover from whenever it last had
+# one and goes stale, so this local hook must apply the same author-repo check --
+# no github.repository env var locally, so origin's identity is the equivalent
+# signal. Normalized the same way as the canonical form in a manifest.files
+# entry would be (scheme/creds/.git suffix stripped) so https and ssh remotes
+# both match; origin missing or unreadable also skips, since there is then no
+# basis to claim this is the author's repo.
+VALIDATOR_REPO_MATCH=false
+if command -v git >/dev/null 2>&1; then
+    ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
+    # Lowercased: GitHub resolves org/repo names case-insensitively at the git
+    # protocol level (smart-HTTP/SSH clone, not just the web redirect), so an
+    # origin spelled in a different case is still the canonical repo -- found
+    # in review, the unnormalized comparison gave a false negative there.
+    ORIGIN_NORMALIZED=$(printf '%s' "$ORIGIN_URL" \
+        | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#^[^@/]*@##; s#:#/#; s#\.git$##' \
+        | tr '[:upper:]' '[:lower:]')
+    [ "$ORIGIN_NORMALIZED" = "github.com/tserentserenov/fmt-exocortex-template" ] && VALIDATOR_REPO_MATCH=true
+fi
+if [ -n "$STAGED_VALIDATOR_SCOPE" ] && [ "$VALIDATOR_REPO_MATCH" != "true" ]; then
+    echo "INTEGRATION-CONTRACT-VALIDATOR: пропущен — origin не author-репозиторий (#1234), setup/integration-contract-validator.sh в excluded_paths и не синхронизируется update.sh"
+elif [ -n "$STAGED_VALIDATOR_SCOPE" ] && [ -x "setup/integration-contract-validator.sh" ]; then
     if ! bash setup/integration-contract-validator.sh >/tmp/iwe-icv.$$ 2>&1; then
         echo "INTEGRATION-CONTRACT-VALIDATOR: FAIL"
         cat /tmp/iwe-icv.$$

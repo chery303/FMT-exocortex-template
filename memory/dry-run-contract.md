@@ -179,7 +179,7 @@ Day Close (см. код: только `git log`/`grep`/`ls`/`wc`/`python3 <scrip
 
 ```
 . "$HOME/.iwe-paths"
-. "${IWE_PATHS_FILE:-$HOME/.iwe-paths}"
+IWE_PATHS="${IWE_PATHS_FILE:-}"; if [ -z "$IWE_PATHS" ]; then for _c in "$PWD/.iwe-paths" "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths" "$HOME/.iwe-paths"; do [ -r "$_c" ] && { IWE_PATHS="$_c"; break; }; done; fi; [ -n "$IWE_PATHS" ] && . "$IWE_PATHS"
 ```
 
 (и те же формы через `source` вместо `.`). Файл `.iwe-paths` — read-only

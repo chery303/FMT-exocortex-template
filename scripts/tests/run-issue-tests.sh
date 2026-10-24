@@ -29,6 +29,9 @@ ADDITIONAL_ISSUE_TESTS=(
     "scripts/tests/test_hook_classification.sh"
     "scripts/tests/test_launchd_identity_runtime.sh"
     "scripts/tests/test_update_install_path_guard.sh"
+    "scripts/tests/test_1229_sync_bundle.sh"
+    "scripts/tests/test_1230_publish.sh"
+    "scripts/tests/test_1231_artifactor.sh"
     "scripts/tests/test_update_install_path_guard_provenance.sh"
 )
 

@@ -72,7 +72,7 @@ class ExtractorPipelineTests(unittest.TestCase):
         self.run_command(["git", "clone", str(remote), str(canonical)])
         return canonical, publisher, remote
 
-    def shell(self, command, *, runner=RUNNER, variables=None, check=True):
+    def shell(self, command, *, runner=RUNNER, variables=None, check=True, as_root=False):
         # Load the real function bodies without production startup/auth/notifications.
         functions = re.findall(r"^\w+\(\) \{[^\n]*\n.*?^\}", runner.read_text(), re.M | re.S)
         values = {
@@ -95,7 +95,19 @@ class ExtractorPipelineTests(unittest.TestCase):
             "extractor_scope_open_and_note() { return 0; }",
             "extractor_scope_close() { :; }", command,
         ]))
-        return self.run_command(["bash", str(script)], check=check)
+        # as_root: a real EUID 0 inside an unprivileged user namespace (bash's
+        # EUID is read-only, so no in-process env var can fake it) -- see the
+        # namespace-based integration test further down this class.
+        args = ["unshare", "--map-root-user", "--", "bash", str(script)] if as_root else ["bash", str(script)]
+        return self.run_command(args, check=check)
+
+    def require_unprivileged_userns(self):
+        try:
+            probe = subprocess.run(["unshare", "--map-root-user", "--", "true"], capture_output=True, timeout=2)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            self.skipTest("unshare --map-root-user unavailable (no binary or timed out)")
+        if probe.returncode != 0:
+            self.skipTest(f"unshare --map-root-user refused (rc={probe.returncode}): likely AppArmor-restricted unprivileged userns")
 
     def make_pack(self):
         return self.published_repo("PACK-fixture", {"pack/known.md": "---\nid: DP.M.001\n---\nExisting method\n"})
@@ -280,6 +292,73 @@ reports.mkdir()
         self.assertIn("Completed process: inbox-check", result.stdout)
         published = self.git(remote, "show", "main:inbox/fleeting-notes.md")
         self.assertIn("[analyzed 2026-09-12]", published)
+
+    # issue #1116 cold-review follow-up (WP-545 Ф15): assert_ai_cli_root_compat
+    # had no direct test. IWE_EXTRACTOR_TEST_EUID lets the fixture drive both
+    # branches deterministically; the unshare variant below additionally
+    # proves the real (non-overridden) $EUID path under a genuine EUID 0.
+    def test_assert_ai_cli_root_compat_blocks_dangerous_flag_under_root(self):
+        result = self.shell(
+            'assert_ai_cli_root_compat "--dangerously-skip-permissions"',
+            variables={"IWE_EXTRACTOR_TEST_EUID": "0"}, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("несовместим с --dangerously-skip-permissions", result.stderr)
+
+    def test_assert_ai_cli_root_compat_allows_safe_flags_under_root(self):
+        result = self.shell(
+            'assert_ai_cli_root_compat "--allowedTools Read"',
+            variables={"IWE_EXTRACTOR_TEST_EUID": "0"},
+        )
+        self.assertEqual(result.returncode, 0)
+
+    def test_assert_ai_cli_root_compat_allows_dangerous_flag_when_not_root(self):
+        result = self.shell(
+            'assert_ai_cli_root_compat "--dangerously-skip-permissions"',
+            variables={"IWE_EXTRACTOR_TEST_EUID": "1000"},
+        )
+        self.assertEqual(result.returncode, 0)
+
+    def test_assert_ai_cli_root_compat_real_root_via_namespace(self):
+        self.require_unprivileged_userns()
+        result = self.shell('assert_ai_cli_root_compat "--dangerously-skip-permissions"', as_root=True, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("несовместим с --dangerously-skip-permissions", result.stderr)
+
+    # issue #928 cold-review follow-up (WP-545 Ф15): resolve_tool_path had no
+    # direct test for its three-step fallback chain.
+    def test_resolve_tool_path_finds_iwe_scripts_first(self):
+        scripts_dir = self.base / "iwe-scripts"
+        tool = self.write(scripts_dir / "session-guard.sh", "#!/bin/sh\n")
+        tool.chmod(0o700)
+        result = self.shell("resolve_tool_path session-guard.sh", variables={"IWE_SCRIPTS": str(scripts_dir)})
+        self.assertEqual(result.stdout.strip(), str(tool))
+
+    def test_resolve_tool_path_falls_back_to_template_scripts(self):
+        # Deliberately exercises the real scripts/session-guard.sh shipped in
+        # this repo (not a fixture) to prove the actual fallback chain works,
+        # not a stand-in path; a future rename/move of that file needs a
+        # matching update here.
+        result = self.shell(
+            "resolve_tool_path session-guard.sh",
+            variables={"IWE_SCRIPTS": str(self.base / "missing")},
+        )
+        self.assertEqual(result.stdout.strip(), str(ROOT / "scripts/session-guard.sh"))
+
+    def test_resolve_tool_path_not_found_reports_all_tried_paths(self):
+        home = self.base / "home"
+        result = self.shell(
+            "resolve_tool_path no-such-tool.sh",
+            variables={"IWE_SCRIPTS": str(self.base / "missing"), "IWE_TEMPLATE": str(self.base / "missing-template"), "HOME": str(home)},
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        # resolve_tool_path's only output on failure is the WARN via log(),
+        # which (like every other caller in this file) writes to stdout, not
+        # stderr — see log()'s unredirected second `echo`.
+        self.assertIn(f"{self.base}/missing/no-such-tool.sh", result.stdout)
+        self.assertIn(f"{self.base}/missing-template/scripts/no-such-tool.sh", result.stdout)
+        self.assertIn(f"{home}/IWE/scripts/no-such-tool.sh", result.stdout)
 
     def test_single_letter_ids_and_declarations(self):
         text = "id: DP.D.999\nFile: DP.D.999-new-card.md\nRelated: DP.D.001 DP.M.002 DP.FM.003\n"
