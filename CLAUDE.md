@@ -23,7 +23,7 @@
 1. **WP Gate:** ЛЮБОЕ задание → `memory/protocol-open.md` ДО начала работы. Новый РП → Ритуал согласования → явное «да»/«делаем»/«открывай»; без этого не регистрировать.
 2. **Push:** «заливай»/«запуши»/«закрывай» → commit + push без вопросов, ДО отчёта Закрытия. Любой Close: `git status --short` по всем репо → незафиксированное commit + push ДО следующего шага.
 3. **Close:** Триггер Закрытия → протокол Закрытия → выполнить.
-4. **Pull-on-Touch:** PreToolUse-хук автоматически делает best-effort `git pull --rebase --autostash` один раз на репо. Не выполняй ручной `cd && git pull`; при сбое хук сообщает `potentially stale`, процедура → `memory/reference/agent-core.md`.
+4. **Pull-on-Touch:** PreToolUse-хук при первом обращении к репо за сессию проверяет свежесть; чистую отставшую копию обновляет через `fetch` и `merge --ff-only --no-autostash`. При несохранённых правках или отказе оставляет их на месте и сообщает `potentially stale`. Не заменяй эту проверку ручным `pull`, `rebase` или `stash`; порядок → `memory/reference/agent-core.md`.
 5. **Чеклист-верификация:** Quick/Day Close — sub-agent Haiku R23 сверяет с чеклистом. Исключения: ≤15 мин или без изменений файлов.
 6. **Hooks/Scripts Bypass Gate (S-33):** без явного разрешения не менять `.claude/hooks|scripts/`, `.iwe-runtime/`, `FMT-exocortex-template/`, не обходить хуки; блок хука → bug-файл + пилоту + ждать. → `.claude/rules-lazy/hooks-bypass-gate.md`.
 7. **Автономность:** не спрашивать подтверждения — выполни → отчитайся. Исключения: необратимо-разрушительное; WP Gate Ритуал; choice-question. Полный текст → `.claude/rules-lazy/blocking-rules-full.md` п.7.
@@ -76,7 +76,7 @@ Hot-каркас ≤20K токенов (M1), строгая цель ≤12K (M2)
 > **3 слоя:** L1 (§1-§7) = платформа (`update.sh`). L2 (§8) = staging. L3 (§9) = авторское.
 > Протоколы → `memory/protocol-*.md` · различения → `.claude/rules/distinctions.md` · форматирование → `.claude/rules/formatting.md` · стабильные знания → `memory/*.md` · свои правила → §8/§9.
 
-> **Extensions Gate (БЛОКИРУЮЩЕЕ для Edit/Write; советующее в целом):** пользовательские правила идут в `extensions/*.md`, настройки в файл параметров (образец `params.yaml.example`); новый project-local skill допустим в `.claude/skills/<name>/`, если такого каталога нет в `update-manifest.json` (issue #311); платформенные скиллы и `memory/protocol-*.md` напрямую не править (обновление их перезапишет). Хук перехватывает `Edit|Write`, но не разбирает произвольные Bash-команды: это защита от случайной правки, не граница безопасности.
+> **Extensions Gate (БЛОКИРУЮЩЕЕ для Edit/Write; советующее в целом):** пользовательские правила идут в `extensions/*.md`, настройки в файл параметров (образец `params.yaml.example`); новый project-local skill допустим в `.claude/skills/<name>/`, если такого каталога нет в `update-manifest.json` (issue #311); платформенные скиллы и `memory/protocol-*.md` напрямую не править (обновление их перезапишет). Хук перехватывает `Edit|Write`, но не разбирает произвольные Bash-команды: это защита от случайной правки, не граница безопасности. **`extensions/` поддерживает только плоские файлы верхнего уровня, без подкаталогов** — подкаталоги не зеркалируются в exocortex-бэкап и не восстанавливаются при переезде на другое устройство (issue #1310); это явный контракт, не пробел.
 
 > **Obsidian:** поддерживаемый vault — отдельный governance-репозиторий `{{GOVERNANCE_REPO}}`; корень `{{WORKSPACE_DIR}}` не открывать как vault из-за больших Markdown-файлов (например, `FPF/FPF-Spec.md`). Весь workspace просматривать через VS Code.
 

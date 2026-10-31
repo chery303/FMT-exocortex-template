@@ -26,6 +26,8 @@ substituted:
   # Strategist (стратегические сессии, планирование)
   - roles/strategist/scripts/launchd/com.strategist.morning.plist
   - roles/strategist/scripts/launchd/com.strategist.weekreview.plist
+  # Migration source for an existing note-review job; never installed by default.
+  - roles/strategist/scripts/launchd/com.strategist.notereview.plist
   # issue #319: symmetric Linux units, launchd/*.plist macOS-only until now
   - roles/strategist/scripts/systemd/iwe-strategist-morning.service
   - roles/strategist/scripts/systemd/iwe-strategist-morning.timer
@@ -54,6 +56,7 @@ substituted:
   - roles/synchronizer/scripts/templates/extractor.sh
   - roles/synchronizer/scripts/templates/strategist.sh
   - roles/synchronizer/scripts/templates/synchronizer.sh
+  - roles/synchronizer/scripts/templates/capabilities.sh
   - roles/synchronizer/config.yaml
 
 # === COPIED_TO_WORKSPACE: FMT → $WORKSPACE_DIR/<path> (без substitution) ===

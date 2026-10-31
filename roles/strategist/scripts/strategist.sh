@@ -182,7 +182,9 @@ mkdir -p "$LOG_DIR"
 
 # Определяем день недели и тип сценария
 DAY_OF_WEEK=$(date +%u)  # 1=Mon, 7=Sun
-DATE=$(date +%Y-%m-%d)
+# STRATEGIST_DATE_OVERRIDE — шов для тестов границы полуночи (WP-568): наблюдатель
+# обязан сигналить о плане «вчера», а не молча defer'ить, когда сверка пересекла 00:00.
+DATE="${STRATEGIST_DATE_OVERRIDE:-$(date +%Y-%m-%d)}"
 # issue #616: "первый Пн месяца" — календарная арифметика, не факт даты;
 # LLM однажды вывела её из головы и ошиблась (последний Пн августа принят за
 # первый Пн сентября). Считаем детерминированно здесь и передаём как готовый
@@ -914,8 +916,15 @@ ${prompt}"
     else
         extra_flags=("${model_args[@]}" --allowedTools "Read,Write,Edit,Glob,Grep,Bash${calendar_mcp:+,$calendar_mcp}")
     fi
+    # issue #1279: on a frozen canon memory-exocortex-sync.sh mirrors into it only when the run
+    # really holds the --canonical-owner right (otherwise it hands the change to
+    # scripts/exocortex-publish.sh); always set explicitly so nothing leaks in.
+    local canonical_owner=""
+    if [ "${RUNNER_SESSION_OPEN:-0}" = 1 ] && [ "$ISOLATED_RUN" != 1 ]; then
+        canonical_owner="$RUNNER_SESSION_REASON"
+    fi
     AI_CLI_OUT_START=$(log_size_bytes)
-    timeout "$CLAUDE_TIMEOUT" "$AI_CLI" \
+    timeout "$CLAUDE_TIMEOUT" env "IWE_CANONICAL_OWNER=$canonical_owner" "$AI_CLI" \
         "${extra_flags[@]}" \
         $AI_CLI_PROMPT_FLAG "$prompt" \
         >> "$LOG_FILE" 2>&1 || rc=$?
@@ -1191,11 +1200,31 @@ DAY_OPEN_ALARM_RETRY_RC=74
 # The pipeline's own contract (day-open-pipeline.sh, steps 1 and 1.1/1.1b): 7 = deferred, not done
 # (yesterday is not closed yet, the triage report is still being published, the week is closing).
 DAY_OPEN_DEFERRED_RC=7
-# A saved scaffold is useful local work, but never a completed Day Open.
-DAY_OPEN_SCAFFOLD_RC=10
+# Issue #1346: the pipeline's own code for "no model gateway configured" (day-open-pipeline.sh §2). Such an
+# install never gets a morning plan, so the morning run says so in ONE message and then stays quiet: this file
+# records that the message was DELIVERED (never written on "Telegram not configured" or on exhausted sends, so the
+# first message still goes out on the first morning after Telegram works). The pipeline is still started every
+# morning (it stops before any model call), so a gateway that appears later re-enables the plan by itself, and the
+# first successful morning removes the file: a gateway that disappears again yields one new message.
+DAY_OPEN_NO_GATEWAY_RC=9
+DAY_OPEN_NO_GATEWAY_REASON=no-gateway-disabled
+DAY_OPEN_NO_GATEWAY_NOTIFIED="${IWE_RUNTIME:-${IWE_WORKSPACE:-$HOME/IWE}/.iwe-runtime}/state/day-open-no-gateway.notified"
 # The scheduler reads exit 2 as "lock held, another run is in progress" (scheduler.sh
 # run_strategist_scenario); a pipeline that failed with 2 is passed out as this code instead.
 DAY_OPEN_RC2_SUBSTITUTE=73
+# WP-568 (25.10.2026, пир-сессия Kimi+Codex+Grok): отказ гарда WP-539 прямому вызову
+# (не night-cycle-runner) — НЕ «конвейер завершился с ошибкой». Свой код, чтобы
+# вызывающий отличал «мне запрещено запускаться» от реального сбоя сборки плана.
+# 77 не уникален в экосистеме (внутренний маркер week-review, exit kimi-session-guard)
+# — но утренний сценарий перехватывает его до выхода, коллизии потоков данных нет.
+DAY_OPEN_REFUSED_RC=77
+# Хост-наблюдатель (ключ observer: true в секции day_open файла day-rhythm-config.yaml):
+# Открытием дня владеет другой хост (серверный night-cycle-runner). План на origin —
+# молчаливый skip; окно владельца не прошло — defer; окно прошло, плана нет — один
+# сигнал «сервер не опубликовал план» в день. Пайплайн не вызываем.
+DAY_OPEN_OBSERVER_AFTER="${DAY_OPEN_OBSERVER_AFTER:-03:30}"  # конец окна владельца, локальное время
+DAY_OPEN_MISSING_MARK="RECORDED: day-open plan missing on origin"
+DAY_OPEN_MISSING_SENT_MARK="Telegram notification sent: strategist/day-open-missing"
 DAY_OPEN_ATTEMPT=0
 
 count_in_log() {  # <literal text> -> number of today's log lines that contain it, 0 without a log
@@ -1233,7 +1262,13 @@ day_open_alarm_owed() {  # 0 = the alarm is not delivered, Telegram is configure
 # record before the pipeline is looked at. That also bounds the sends: every one comes from a give-up or
 # from a transient failure of attempts 1 and 2, and the owed test stops at DAY_OPEN_ALARM_MAX_ATTEMPTS.
 day_open_give_up() {  # <reason code> <reason text> [exit code]
+    local sent_before
+    sent_before=$(count_in_log "$DAY_OPEN_ALARM_SENT_MARK")
     day_open_alarm "$@"
+    if [ "$1" = "$DAY_OPEN_NO_GATEWAY_REASON" ] \
+        && [ "$(count_in_log "$DAY_OPEN_ALARM_SENT_MARK")" -gt "$sent_before" ]; then
+        day_open_no_gateway_mark_notified
+    fi
     if day_open_alarm_owed; then
         log "$DAY_OPEN_GIVEUP_PENDING_MARK$1|${3:-}|$2"
         log "Day Open: тревога не доставлена, повтор доставки при следующем запуске планировщика без нового запуска конвейера, код $DAY_OPEN_ALARM_RETRY_RC ($2)"
@@ -1241,6 +1276,32 @@ day_open_give_up() {  # <reason code> <reason text> [exit code]
     fi
     log "GAVE UP scenario: day-plan ($2)"
     exit 0
+}
+
+day_open_no_gateway_mark_notified() {  # records that THIS run delivered the no-gateway message (issue #1346)
+    if mkdir -p "$(dirname "$DAY_OPEN_NO_GATEWAY_NOTIFIED")" 2>/dev/null \
+        && : > "$DAY_OPEN_NO_GATEWAY_NOTIFIED" 2>/dev/null; then
+        log "Day Open: сообщение «шлюз модели не настроен» доставлено, отметка записана: $DAY_OPEN_NO_GATEWAY_NOTIFIED"
+    else
+        log "WARN: не удалось записать отметку $DAY_OPEN_NO_GATEWAY_NOTIFIED — завтра сообщение о шлюзе уйдёт снова"
+    fi
+}
+
+day_open_no_gateway_clear() {  # a morning that built the plan: the next loss of the gateway yields one new message
+    [ -e "$DAY_OPEN_NO_GATEWAY_NOTIFIED" ] || return 0
+    if rm -f "$DAY_OPEN_NO_GATEWAY_NOTIFIED"; then
+        log "Day Open: шлюз модели снова работает, отметка о сообщении «шлюз не настроен» снята"
+    else
+        log "WARN: не удалось снять отметку $DAY_OPEN_NO_GATEWAY_NOTIFIED — при новой пропаже шлюза сообщения не будет"
+    fi
+}
+
+day_open_no_gateway() {  # pipeline exit 9: no plan attempt without a gateway; one delivered message, then quiet days
+    if [ -e "$DAY_OPEN_NO_GATEWAY_NOTIFIED" ]; then
+        log "GAVE UP scenario: day-plan (шлюз модели не настроен — автоматический утренний план выключен, сообщение уже отправлено; вручную: «открывай»)"
+        exit 0
+    fi
+    day_open_give_up "$DAY_OPEN_NO_GATEWAY_REASON" "шлюз модели не настроен — автоматический утренний план выключен; конвейер по-прежнему запускается каждое утро без обращения к модели и включит план сам, когда шлюз появится; вручную: «открывай»" "$DAY_OPEN_NO_GATEWAY_RC"
 }
 
 day_open_resume_pending_give_up() {  # finishes a give-up whose alarm is still owed; returns when there is none
@@ -1252,6 +1313,77 @@ day_open_resume_pending_give_up() {  # finishes a give-up whose alarm is still o
     rec=${rec#*|}
     rc=${rec%%|*}
     day_open_give_up "$code" "${rec#*|}" "$rc"
+}
+
+# WP-568 (25.10.2026): включено ключом observer: true в секции day_open файла
+# day-rhythm-config.yaml — для установок, где Открытием дня владеет другой хост
+# (серверный night-cycle-runner; гард WP-539 отказывает прямым вызовам). Без ключа
+# поведение прежнее: эта установка сама открывает день утренним прогоном.
+# Источники конфига — те же, что у остального контура: сначала rhythm-конфиг
+# стратега (RHYTHM_CONFIG), затем runtime-конфиг установки (его же читает пайплайн).
+day_open_observer_enabled() {
+    local cfg
+    for cfg in "${RHYTHM_CONFIG:-}" "${IWE_RUNTIME:-$HOME/IWE/.iwe-runtime}/day-rhythm-config.yaml"; do
+        [ -n "$cfg" ] && [ -f "$cfg" ] \
+            && sed -n '/^day_open:/,/^[a-z_]/p' "$cfg" | grep -q '^  observer: true' && return 0
+    done
+    return 1
+}
+
+# Наблюдатель вместо запуска пайплайна. Сверка read-only для дерева и индекса:
+# fetch пишет только remote-tracking ref (явный refspec ниже), cat-file проверяет
+# путь в том же коммите. fetch недоступен (сеть) — defer и никакого сигнала: иначе
+# сетевой сбой превратился бы в ложное «сервер не опубликовал план».
+# Выходы функции: 0 (план есть / сигнал доставлен / Telegram не настроен),
+# 7 (отложить: fetch невозможен или окно владельца не прошло), 74 (сигнал не
+# доставлен — повторить при следующем запуске). Выходы — exit; день стратегии
+# зовёт функцию в подоболочке, чтобы exit'ы не прерывали session-prep.
+day_open_observe() {
+    local plan_path="current/DayPlan $DATE.md"
+    # Ветка по умолчанию — из resolve_default_branch() (issue #1097), не литерал «main»:
+    # на установке с master fetch в main дал бы постоянный ложный defer. Явный refspec
+    # вместо FETCH_HEAD: перезапись ref чужим fetch между командами безопасна — сервер
+    # план только добавляет, так что ref движется монотонно и сверка не врёт.
+    if ! timeout 30 git -C "$WORKSPACE" fetch --quiet origin \
+            "+refs/heads/$GIT_DEFAULT_BRANCH:refs/remotes/origin/$GIT_DEFAULT_BRANCH" 2>/dev/null; then
+        log "Day Open: сверка плана с origin не удалась (сеть?) — сигнал «нет плана» не шлю, отложил (код $DAY_OPEN_DEFERRED_RC)"
+        exit "$DAY_OPEN_DEFERRED_RC"
+    fi
+    if git -C "$WORKSPACE" cat-file -e "refs/remotes/origin/$GIT_DEFAULT_BRANCH:$plan_path" 2>/dev/null; then
+        log "SKIP: DayPlan $DATE уже опубликован на origin (владелец — серверный day-open); этот хост наблюдатель, пайплайн не запускаю"
+        exit 0
+    fi
+    local now today
+    now=$(date +%H:%M)
+    today=$(date +%Y-%m-%d)
+    # Полночь между стартом и сверкой: для вчерашнего DATE окно владельца однозначно
+    # прошло — не defer'им, иначе сигнал о вчерашнем плане потерялся бы навсегда
+    # (следующий запуск проверит уже новую дату; ред-комментарий Codex, РП-568).
+    if [ "$DATE" = "$today" ] && [ "$now" \< "$DAY_OPEN_OBSERVER_AFTER" ]; then
+        log "Day Open: окно владельца ещё не прошло ($now < $DAY_OPEN_OBSERVER_AFTER, локальное время) — план ещё может появиться; отложил (код $DAY_OPEN_DEFERRED_RC)"
+        exit "$DAY_OPEN_DEFERRED_RC"
+    fi
+    if grep -qF "$DAY_OPEN_MISSING_SENT_MARK" "$LOG_FILE" 2>/dev/null; then
+        log "Day Open: сигнал «сервер не опубликовал план» сегодня уже отправлен, повторно не шлю"
+        exit 0
+    fi
+    log "$DAY_OPEN_MISSING_MARK (окно владельца прошло: $now >= $DAY_OPEN_OBSERVER_AFTER, сверка с origin выполнена)"
+    # Дата сверки фиксируется здесь: шаблон при отправке пересчитывает свою дату сам,
+    # и прогон через полночь назвал бы в сигнале не тот день (ред-комментарий Codex, РП-568).
+    DAY_OPEN_PLAN_DATE="$DATE" notify_telegram "day-open-missing"
+    if grep -qF "$DAY_OPEN_MISSING_SENT_MARK" "$LOG_FILE" 2>/dev/null; then
+        log "GAVE UP scenario: day-plan (плана нет на origin после окна владельца; сигнал доставлен; пайплайн наблюдатель не запускает)"
+        exit 0
+    fi
+    if grep -qF "$DAY_OPEN_ALARM_UNCONFIGURED_MARK" "$LOG_FILE" 2>/dev/null; then
+        # Как day_open_alarm_owed(): Telegram не настроен — повторы бесполезны, день отдаём без сигнала.
+        log "GAVE UP scenario: day-plan (плана нет на origin после окна владельца; Telegram не настроен — сигнал невозможен, повторы бесполезны)"
+        exit 0
+    fi
+    # Доставка не подтверждена (сеть/Telegram молчит) — день НЕ отдаём: следующий запуск
+    # планировщика повторит сигнал. Иначе единственный сигнал терялся бы до конца дня.
+    log "Day Open: сигнал «сервер не опубликовал план» не доставлен — повтор доставки при следующем запуске планировщика, код $DAY_OPEN_ALARM_RETRY_RC"
+    exit "$DAY_OPEN_ALARM_RETRY_RC"
 }
 
 day_open_start_attempt() {  # gives up instead when DAY_OPEN_MAX_ATTEMPTS attempts already started today
@@ -1572,10 +1704,30 @@ case "$1" in
         day_open_resume_pending_give_up
 
         if [ "$DAY_OF_WEEK" -eq "$STRATEGY_DAY_NUM" ]; then
+            # WP-568: и в день стратегии наблюдатель смотрит серверный план — иначе пропажа
+            # плана осталась бы незамеченной ровно в этот день (утро уходит в session-prep).
+            # Подоболочка: exit'ы наблюдателя (0/7/74) гасятся в ней и не прерывают сценарий.
+            observe_rc=0
+            if day_open_observer_enabled; then
+                ( day_open_observe ) || observe_rc=$?
+            fi
+            if [ "$observe_rc" -eq "$DAY_OPEN_DEFERRED_RC" ] || [ "$observe_rc" -eq "$DAY_OPEN_ALARM_RETRY_RC" ]; then
+                # Проверка не состоялась (сеть) или сигнал не доставлен. НЕ глушим код:
+                # иначе SUCCESS session-prep закроет день и пропажа плана останется
+                # незамеченной до завтра (ред-комментарий Codex, РП-568). session-prep
+                # откладывается до следующего тика планировщика.
+                log "Day Open: наблюдатель не подтвердил серверный план (код $observe_rc) — session-prep отложен до следующего запуска планировщика"
+                exit "$observe_rc"
+            fi
             log "Strategy day ($STRATEGY_DAY_NAME): running session prep"
             run_claude "session-prep" ""
             notify_telegram "session-prep"
         else
+            # WP-568 (25.10.2026): хост-наблюдатель (day_open.observer в day-rhythm-config.yaml)
+            # сам день не открывает — смотри day_open_observe().
+            if day_open_observer_enabled; then
+                day_open_observe
+            fi
             # Canonical Day Open pipeline: deterministic scaffold (reads priorities.yaml,
             # enforces ТВС section order, runs server-news.sh for «Мир»). It is the only
             # morning path: a failure alarms instead of a free-form plan (D16, see
@@ -1630,24 +1782,25 @@ case "$1" in
             DAY_OPEN_NOTIFICATION_OWNER=strategist DAY_OPEN_QUIET_RETRY="$retry_quiet" bash "$DAY_OPEN_PIPELINE" >> "$LOG_FILE" 2>&1 || pipeline_rc=$?
             if [ "$pipeline_rc" -eq 0 ]; then
                 log "$DAY_OPEN_OK_MARK (scaffold + llm-fill)"
+                day_open_no_gateway_clear
             elif [ "$pipeline_rc" -eq "$DAY_OPEN_DEFERRED_RC" ]; then
                 day_open_deferred
-            elif [ "$pipeline_rc" -eq 9 ]; then
-                # issue #893: exit 9 = no gateway configured (day-open-pipeline.sh
-                # §2), a case the pipeline itself already ships an answer for
-                # (--scaffold-only, issue #434). The retry's own code is kept
-                # right away: it is what the alarm reports.
-                log "Morning: Day Open pipeline has no gateway configured — retrying with --scaffold-only"
-                scaffold_rc=0
-                DAY_OPEN_NOTIFICATION_OWNER=strategist DAY_OPEN_QUIET_RETRY="$retry_quiet" bash "$DAY_OPEN_PIPELINE" --scaffold-only >> "$LOG_FILE" 2>&1 || scaffold_rc=$?
-                if [ "$scaffold_rc" -eq "$DAY_OPEN_SCAFFOLD_RC" ]; then
-                    scaffold_path="${IWE_WORKSPACE:-$HOME/IWE}/.tmp/day-open-scaffold/DayPlan $(date +%Y-%m-%d).md"
-                    day_open_give_up scaffold-incomplete "шлюз модели не настроен; неполный каркас сохранён: $scaffold_path. День не открыт; правки черновика не переносятся автоматически в полный план" "$scaffold_rc"
-                elif [ "$scaffold_rc" -eq "$DAY_OPEN_DEFERRED_RC" ]; then
-                    day_open_deferred
-                else
-                    day_open_give_up scaffold-only-failed "шлюз модели не настроен (код 9), повтор с --scaffold-only тоже не прошёл: код $scaffold_rc (причина в строках выше)" "$scaffold_rc"
-                fi
+            elif [ "$pipeline_rc" -eq "$DAY_OPEN_REFUSED_RC" ]; then
+                # Гард WP-539: прямой вызов вне night-cycle-runner. Не сбой и не «план не
+                # собран» — владелец дня живёт на другом хосте. Тихий skip, тревоги нет.
+                log "Day Open: пайплайн отказал прямому вызову (гард WP-539: не night-cycle-runner) — не сбой, тревоги нет, пропускаю"
+                # Попытка уже записана day_open_start_attempt выше, а отказ — не «день прогнан»
+                # (SUCCESS/GAVE UP нет, already_ran_today пропустит повтор) — компенсируем отсрочкой,
+                # иначе N прямых запусков за день (RunAtLoad после перезагрузок) исчерпают
+                # DAY_OPEN_MAX_ATTEMPTS и вызовут ложную тревогу attempts-exhausted (ред-комментарий Codex, РП-568).
+                log "$DAY_OPEN_DEFERRED_MARK: гард WP-539 отказал прямому вызову (код $DAY_OPEN_REFUSED_RC) — этот хост не владеет Открытием дня; не сбой: тревоги нет, попытка не засчитана"
+                exit 0
+            elif [ "$pipeline_rc" -eq "$DAY_OPEN_NO_GATEWAY_RC" ]; then
+                # issue #1346: no gateway configured (day-open-pipeline.sh §2). No --scaffold-only retry: its
+                # draft is incomplete by design (#983), so it only produced a daily alarm and never a plan.
+                # One delivered message, then quiet days -- see day_open_no_gateway() above.
+                log "Morning: Day Open pipeline has no gateway configured — automatic morning plan is off (issue #1346)"
+                day_open_no_gateway
             else
                 day_open_transient_failure "$pipeline_rc"
             fi

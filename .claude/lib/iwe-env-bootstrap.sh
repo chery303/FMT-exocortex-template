@@ -105,8 +105,17 @@ export IWE_RUNTIME="${IWE_RUNTIME:-${WORKSPACE_DIR}/.iwe-runtime}"
 # a README and audit logs, or personal scripts plus symlinks into the template,
 # must not hide the platform scripts. The marker proves "live checkout", not a
 # complete file set. Keep in sync with setup/install-iwe-paths.sh (same rule).
+#
+# Issue #957 recurrence (Artem, 21.10): a short local exec-wrapper around the
+# template's session-guard.sh (common workaround for an env/launchd gap) is a
+# regular, non-symlink file too -- it used to win this check the same way a
+# real checkout would. Treat a small file that execs into IWE_TEMPLATE as a
+# wrapper, not a checkout.
+_IWE_SG_MARKER="${WORKSPACE_DIR}/scripts/session-guard.sh"
 if [ -z "${IWE_SCRIPTS:-}" ]; then
-  if [ -f "${WORKSPACE_DIR}/scripts/session-guard.sh" ] && [ ! -L "${WORKSPACE_DIR}/scripts/session-guard.sh" ]; then
+  if [ -f "$_IWE_SG_MARKER" ] && [ ! -L "$_IWE_SG_MARKER" ] \
+     && ! { [ "$(wc -l < "$_IWE_SG_MARKER" 2>/dev/null || echo 0)" -le 30 ] \
+            && grep -qE 'exec[[:space:]]+(bash[[:space:]]+)?"?\$\{?IWE_TEMPLATE' "$_IWE_SG_MARKER" 2>/dev/null; }; then
     export IWE_SCRIPTS="${WORKSPACE_DIR}/scripts"
   else
     # IWE_TEMPLATE honours .exocortex.env (renamed template folder, #933);
@@ -114,6 +123,7 @@ if [ -z "${IWE_SCRIPTS:-}" ]; then
     export IWE_SCRIPTS="${IWE_TEMPLATE}/scripts"
   fi
 fi
+unset _IWE_SG_MARKER
 
 # Export to child processes
 export WORKSPACE_DIR
@@ -178,15 +188,58 @@ elif [ "$IWE_OS" = "macos" ]; then
 else
   export IWE_ICLOUD_BACKUP_DIR=""
 fi
-# IWE_ICLOUD_ROOT stays iCloud-specific (backup-icloud.sh's own mount sanity
-# check) regardless of backup_dir — a custom non-iCloud target skips
-# backup-icloud.sh entirely via backup_enabled: false (SKILL.md §7a/7b), it
-# does not repurpose this check.
+# IWE_ICLOUD_ROOT stays iCloud-specific regardless of backup_dir: it is the
+# mount that must exist when the backup target lies inside iCloud Drive
+# (backup-icloud.sh, iwe-backup-check.sh — issue #1349). A backup_dir outside it
+# is a plain directory on any OS and is not checked against this root; use
+# iwe_path_inside to tell the two cases apart.
 if [ "$IWE_OS" = "macos" ]; then
   export IWE_ICLOUD_ROOT="${HOME}/Library/Mobile Documents/com~apple~CloudDocs"
 else
   export IWE_ICLOUD_ROOT=""
 fi
+
+# iwe_normalize_path PATH — physical absolute path (symlinks resolved). The
+# path may not exist yet (a backup target is created on first use): the
+# nearest existing ancestor is resolved and the missing tail is appended
+# lexically, with "." and ".." folded.
+iwe_normalize_path() {
+  local path="$1" tail="" name head skip=0
+  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+  while [ ! -d "$path" ]; do
+    name="${path##*/}"
+    path="${path%/*}"
+    [ -n "$path" ] || path="/"
+    case "$name" in
+      ""|.) ;;
+      ..) skip=$((skip + 1)) ;;
+      *) if [ "$skip" -gt 0 ]; then skip=$((skip - 1)); else tail="/$name$tail"; fi ;;
+    esac
+  done
+  head=$(CDPATH='' cd -P -- "$path" 2>/dev/null && pwd -P) || return 1
+  while [ "$skip" -gt 0 ]; do
+    head="${head%/*}"
+    skip=$((skip - 1))
+  done
+  [ "$head" = "/" ] && head=""
+  head="${head}${tail}"
+  printf '%s\n' "${head:-/}"
+}
+
+# iwe_path_inside CHILD PARENT — true when CHILD is PARENT or lies under it,
+# compared component-wise on normalised paths (not a raw string prefix, so
+# ".../CloudDocs-other" is not inside ".../CloudDocs"). Empty PARENT → false.
+iwe_path_inside() {
+  local child parent
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+  child=$(iwe_normalize_path "$1") || return 1
+  parent=$(iwe_normalize_path "$2") || return 1
+  [ "$parent" = "/" ] && return 0
+  case "$child/" in
+    "$parent"/*) return 0 ;;
+  esac
+  return 1
+}
 
 # Debug output (optional)
 if [ "${IWE_ENV_BOOTSTRAP_DEBUG:-0}" = "1" ]; then

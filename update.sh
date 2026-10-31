@@ -50,11 +50,12 @@ UPDATE_CHANNEL="${IWE_UPDATE_CHANNEL:-release}"
 # user who explicitly asked for the pinned release. Fail closed and name the
 # accepted values instead of guessing which one was meant.
 case "$UPDATE_CHANNEL" in
-    release|main) ;;
+    release|main|rc) ;;
     *)
         echo "✗ Неизвестный канал обновления: IWE_UPDATE_CHANNEL='$UPDATE_CHANNEL'" >&2
         echo "  Допустимые значения:" >&2
         echo "    release — последний опубликованный выпуск (по умолчанию)" >&2
+        echo "    rc      — кандидат в выпуск (для тестировщиков; ставит ровно то, что проверяется перед релизом)" >&2
         echo "    main    — движущаяся ветка разработки (только для автора)" >&2
         echo "  Обновление остановлено: неизвестное значение раньше молча уводило на main." >&2
         exit "$EXIT_USAGE"
@@ -67,6 +68,7 @@ API_BASE="https://api.github.com/repos/$REPO"
 RELEASE_SHA=""
 
 CHECK_ONLY=false
+STRICT_CHECK=false   # WP-529 Ф220: --dry-run-strict — структурная проверка плана доставки, не ручной список
 AUTO_YES=false
 FAST_CHECK=false
 # Stage B opt-ins (WP-7 F71, поведение settings-merge скорректировано issue
@@ -205,6 +207,7 @@ fetch_update_manifest() {
 for arg in "$@"; do
     case "$arg" in
         --check|--dry-run)  CHECK_ONLY=true ;;
+        --dry-run-strict)   CHECK_ONLY=true; STRICT_CHECK=true ;;
         --fast)             FAST_CHECK=true ;;
         --yes)              AUTO_YES=true ;;
         --apply-settings-merge) APPLY_SETTINGS_MERGE=true ;;
@@ -216,6 +219,7 @@ for arg in "$@"; do
             echo ""
             echo "Options:"
             echo "  --check     Показать доступные обновления без применения"
+            echo "  --dry-run-strict  С --check: структурная проверка плана доставки (целевые файлы на месте, пути безопасны)"
             echo "  --fast      С --check: сравнить только версию манифеста (без скачивания 300+ файлов, issue #230)"
             echo "  --yes       Применить обновления без подтверждения (включает settings.json merge, см. --no-settings-merge)"
             echo "  --apply-settings-merge  Применить слияние settings.json отдельно от --yes (бэкап + пост-валидация; без флага и без --yes — только предпросмотр)"
@@ -276,6 +280,22 @@ hash_file() {
     else
         sha256sum "$1" | cut -d' ' -f1
     fi
+}
+
+# reinject_user_section FILE USER_SECTION — replace FILE's own USER-SPACE block
+# with the user's one: drop the shipped block, squash trailing blank lines,
+# append the user block. render_skill_with_user_section UPSTREAM USER_SECTION
+# OUT builds the same file from an upstream copy. One definition for every
+# apply path and for the change detector, so a skill with a user block is not
+# reported as "updated" on every run (issue #1010 F10).
+reinject_user_section() {
+    perl -i -0pe 's/^<!-- USER-SPACE -->.*?^<!-- \/USER-SPACE -->//ms' "$1"
+    perl -i -0pe 's/\n+$/\n/' "$1"
+    printf '\n%s\n' "$2" >> "$1"
+}
+render_skill_with_user_section() {
+    cp "$1" "$3"
+    reinject_user_section "$3" "$2"
 }
 
 # === Cross-platform Python resolution (issue #402) ===
@@ -2609,37 +2629,104 @@ backfill_governance_seed_script() {
     fi
 }
 
+# ds_publish_version FILE — print the "# ds-publish version: N" stamp of FILE as a
+# plain decimal (leading zeros dropped) and return 0; return 1 when FILE has no
+# well-formed stamp. Only the FIRST line starting with "# ds-publish version:" is
+# considered and it must match ^# ds-publish version: ([0-9]+)$ exactly: a
+# malformed first stamp ("1a", trailing text, CRLF) means "no stamp", it is never
+# rescued by a later well-formed line. More than 9 digits is also "no stamp": the
+# value is compared with shell arithmetic and must not overflow.
+ds_publish_version() {
+    local line digits
+    line=$(grep -m1 '^# ds-publish version:' "$1" 2>/dev/null) || return 1
+    case "$line" in
+        "# ds-publish version: "*) digits=${line#"# ds-publish version: "} ;;
+        *) return 1 ;;
+    esac
+    case "$digits" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#digits}" -le 9 ] || return 1
+    printf '%s\n' "$((10#$digits))"
+}
+
+# replace_ds_publish_with_backup TARGET SOURCE GOVERNANCE_REPO REASON — keep a copy
+# of TARGET under .backups/ds-publish-pre-update/ (the file is usually untracked, so
+# git has no copy of it), then replace it with SOURCE. Returns 1 and leaves TARGET
+# as it was when the backup cannot be made.
+replace_ds_publish_with_backup() {
+    local target_path="$1" source_path="$2" governance_repo="$3" reason="$4"
+    local backup_dir
+    backup_dir="$WORKSPACE_DIR/.backups/ds-publish-pre-update/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    if [ -L "$WORKSPACE_DIR/.backups" ] || ! mkdir -p "$backup_dir" \
+       || ! cp -p "$target_path" "$backup_dir/ds-publish.sh"; then
+        echo "  ✗ scripts/ds-publish.sh: не удалось сделать резервную копию, прежняя копия остаётся." >&2
+        return 1
+    fi
+    echo "  ↳ backup: $target_path → $backup_dir/ds-publish.sh"
+    atomic_copy_executable "$source_path" "$target_path" || return 1
+    echo "  ⟳ scripts/ds-publish.sh: $reason — заменена на текущую в $governance_repo."
+}
+
 # ds-publish.sh (issue #941): strategist.sh publishes its commits through
-# $governance/scripts/ds-publish.sh, which the template never shipped. Delivered only
-# when the governance repo has no such file: an existing one is not ours to replace
-# (an installation may keep its own, larger publisher at the same path).
+# $governance/scripts/ds-publish.sh, which the template never shipped. Missing copy →
+# delivered. Existing copy → decided by its version stamp (issue #1280):
+#   installed stamp <  shipped stamp → an older template copy: replaced, backup kept;
+#   installed stamp >= shipped stamp → never touched, even if the content differs
+#                                      (that is a deliberate local edit);
+#   no (well-formed) stamp           → migration from the pre-stamp era: a copy whose
+#                                      sha256 is on known_old_publishers was shipped
+#                                      by this template and is replaced; any other
+#                                      unstamped file is the user's own publisher —
+#                                      kept, with a loud warning.
 backfill_ds_publish() {
     local governance_repo="${EFFECTIVE_GOVERNANCE_REPO:-$(effective_governance_repo)}"
     local target_path="$WORKSPACE_DIR/$governance_repo/scripts/ds-publish.sh"
-    # Issue #1003: a copy that THIS template shipped earlier (sha256 on the list) is
-    # not user content: it is replaced even though it lies untracked in the governance
-    # repo (the generic backfill refuses untracked files). Any other file stays.
-    local known_old_publishers="dd9a0e7a3116281763b26a351904f5e21de8d730559a1a77dd2a248f2a986730"
-    local source_path="$SCRIPT_DIR/seed/strategy/scripts/ds-publish.sh" target_hash
+    # FROZEN (issue #1280): no new entries. Every version of
+    # seed/strategy/scripts/ds-publish.sh shipped BEFORE the version stamp existed,
+    # i.e. the whole pre-stamp git history of that file (issue #1003, #1288; the
+    # last one, 19649ea8..., is the copy shipped 15.10-26.10). A hash list was a
+    # trap by construction -- every seed edit minted a hash that was not on it yet
+    # and stranded installs on a stale copy. The "# ds-publish version:" stamp
+    # replaces it; this list only recognises the unstamped legacy copies.
+    local known_old_publishers="dd9a0e7a3116281763b26a351904f5e21de8d730559a1a77dd2a248f2a986730 a86c3f628c06e8b7fe8d7a338c01ff0d7a0794751b4ce1a27affbb11295b2a36 13af55c37bfbf2c74fc4c6d9ac446758a28fc8e727b8f169c96920babc90115e 19649ea85169a92d20890fe68cb97182c53f5616675010edbf428b3eea75ce03"
+    local source_path="$SCRIPT_DIR/seed/strategy/scripts/ds-publish.sh"
+    local target_hash shipped_version installed_version
     if [ -f "$target_path" ] && [ ! -L "$target_path" ] && [ ! -L "$(dirname "$target_path")" ] \
        && [ -f "$source_path" ] && [ ! -L "$source_path" ]; then
+        if ! shipped_version=$(ds_publish_version "$source_path"); then
+            # A release defect, not a user state: never guess, leave the copy alone.
+            echo "  ⚠ scripts/ds-publish.sh: в поставке нет строки «# ds-publish version: N» — существующая копия в $governance_repo оставлена без изменений." >&2
+            return 0
+        fi
+        if installed_version=$(ds_publish_version "$target_path"); then
+            if [ "$installed_version" -lt "$shipped_version" ]; then
+                replace_ds_publish_with_backup "$target_path" "$source_path" "$governance_repo" \
+                    "версия $installed_version старше поставляемой $shipped_version"
+                return
+            fi
+            if ! cmp -s "$source_path" "$target_path"; then
+                echo "  ○ scripts/ds-publish.sh: версия $installed_version не старше поставляемой $shipped_version, содержимое отличается — считаю это вашей правкой, не заменяю."
+            else
+                echo "  ✓ scripts/ds-publish.sh уже совпадает с поставкой (версия $installed_version)."
+            fi
+            return 0
+        fi
         target_hash=$(hash_file "$target_path" 2>/dev/null) || target_hash=""
-        case " $known_old_publishers " in
-            *" $target_hash "*)
-                if [ -n "$target_hash" ]; then
-                    # The file is usually untracked (git has no copy): keep one before replacing.
-                    local backup_dir="$WORKSPACE_DIR/.backups/ds-publish-pre-update/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-                    if [ -L "$WORKSPACE_DIR/.backups" ] || ! mkdir -p "$backup_dir" \
-                       || ! cp -p "$target_path" "$backup_dir/ds-publish.sh"; then
-                        echo "  ✗ scripts/ds-publish.sh: не удалось сделать резервную копию, прежняя копия остаётся." >&2
-                        return 1
-                    fi
-                    echo "  ↳ backup: $target_path → $backup_dir/ds-publish.sh"
-                    atomic_copy_executable "$source_path" "$target_path" || return 1
-                    echo "  ⟳ scripts/ds-publish.sh: прежняя копия шаблона заменена на текущую в $governance_repo."
-                    return 0
-                fi ;;
-        esac
+        if [ -n "$target_hash" ]; then
+            case " $known_old_publishers " in
+                *" $target_hash "*)
+                    replace_ds_publish_with_backup "$target_path" "$source_path" "$governance_repo" \
+                        "прежняя копия шаблона (без номера версии)"
+                    return ;;
+            esac
+        fi
+        {
+            echo "  ⚠ ВНИМАНИЕ: $target_path — без строки «# ds-publish version: N» и не совпадает ни с одной копией, которую поставлял шаблон."
+            echo "    Считаю его вашим собственным публикатором и не заменяю: ночные роли продолжат работать через него."
+            echo "    Принять поставляемую версию вручную: cp \"$target_path\" \"$target_path.mine\" && cp \"$source_path\" \"$target_path\" && chmod +x \"$target_path\""
+        } >&2
+        return 0
     fi
     if [ -e "$target_path" ] || [ -L "$target_path" ]; then
         echo "  ✓ scripts/ds-publish.sh уже есть в $governance_repo, не заменяю."
@@ -2711,10 +2798,12 @@ run_post_apply_backfills_or_die() {
     # scripts/day-open-llm-fill.py is no longer backfilled here (WP-485 Ф17,
     # 2026-10-05): the Day Open pipeline runs it from $IWE_SCRIPTS (the template's
     # own copy, confirmed on a live installation -- ~/.iwe-paths resolves
-    # IWE_SCRIPTS to "$IWE_TEMPLATE/scripts" unconditionally), so a governance-repo
-    # copy is never executed. Delivering it there only risked silently replacing a
-    # pilot's own committed, more-advanced version with an older seed -- the
-    # mechanism behind the reported user incident.
+    # IWE_SCRIPTS to "$IWE_TEMPLATE/scripts" whenever workspace/scripts has no
+    # regular non-wrapper session-guard.sh, per install-iwe-paths.sh #957
+    # recurrence rule), so a governance-repo copy is never executed. Delivering
+    # it there only risked silently replacing a pilot's own committed,
+    # more-advanced version with an older seed -- the mechanism behind the
+    # reported user incident.
 
     echo ""
     echo "Agent fault profile (safe update hardening)..."
@@ -2772,7 +2861,7 @@ run_post_apply_backfills_or_die() {
 # also fires in the TOTAL_CHANGES=0 recovery branches, so an install that is
 # otherwise up to date still gets its feeders. Re-running is safe: the feeders
 # script skips an unchanged, already-loaded launchd job instead of unload/load
-# (which would kill a run in flight at exactly 06:00/21:00).
+# (which would kill a run in flight at exactly 09:00/21:00).
 backfill_extractor_feeders() {
     local feeders="$SCRIPT_DIR/scripts/setup-extractor-feeders.sh"
     local governance_repo="${EFFECTIVE_GOVERNANCE_REPO:-}"
@@ -3005,11 +3094,7 @@ copy_platform_file_preserving_user_space() {
         backup_rule_before_overwrite "$fpath" "$dst"
     fi
     cp "$src" "$dst"
-    if [ -n "$user_section" ]; then
-        perl -i -0pe 's/^<!-- USER-SPACE -->.*?^<!-- \/USER-SPACE -->//ms' "$dst"
-        perl -i -0pe 's/\n+$/\n/' "$dst"
-        printf '\n%s\n' "$user_section" >> "$dst"
-    fi
+    [ -z "$user_section" ] || reinject_user_section "$dst" "$user_section"
 }
 
 # iwe_claude_project_slug PATH — the directory name Claude Code uses under
@@ -3343,6 +3428,113 @@ github_api_get() {
 
 resolve_delivery_ref() {
     local resolved_ref release_tag release_json commit_json api_status
+    local rc_tag refs_json latest_tag
+    if [ "$UPDATE_CHANNEL" = "rc" ]; then
+        # WP-529 Ф239: канал кандидата в выпуск. weekly-release.yml ставит
+        # неизменяемый тег vX.Y.Z-rc.N на bump-коммит релизной ветки. Тег без
+        # GitHub Release невидим для /releases — резолв через git refs API,
+        # выбор максимума по (X,Y,Z,N). Fail-closed как #501: нет кандидата,
+        # сбой API или незакреплённый SHA — отказ, никогда не откат на
+        # main/release молча.
+        if ! py_available; then
+            echo "ОШИБКА: канал rc требует python3 — без него нельзя выбрать свежий кандидат среди rc-тегов." >&2
+            echo "  Повторите на машине с python3 или выберите другой канал (release/main)." >&2
+            exit "$EXIT_NETWORK"
+        fi
+        refs_json=""
+        if refs_json=$(github_api_get "$API_BASE/git/matching-refs/tags/v"); then
+            api_status=0
+        else
+            api_status=$?
+        fi
+        if [ "$api_status" -ne 0 ]; then
+            echo "ОШИБКА: не удалось получить список rc-тегов (API недоступен)." >&2
+            echo "  Канал rc fail-closed: без списка кандидатов обновление не выполняется." >&2
+            exit "$EXIT_NETWORK"
+        fi
+        rc_tag=$(printf '%s\n' "$refs_json" | "$PY_BIN" -c '
+import json, re, sys
+best = None
+try:
+    items = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(1)
+# Full page (100) means the answer may be truncated — the true maximum could
+# sit on the next page. Fail closed instead of picking a stale candidate.
+if len(items) >= 100:
+    print("too many tags, pagination required", file=sys.stderr)
+    raise SystemExit(2)
+for item in items:
+    m = re.fullmatch(r"refs/tags/v(\d+)\.(\d+)\.(\d+)-rc\.(\d+)", item.get("ref", ""))
+    if m:
+        key = tuple(int(g) for g in m.groups())
+        if best is None or key > best[0]:
+            best = (key, item["ref"][len("refs/tags/"):])
+if best is None:
+    raise SystemExit(1)
+print(best[1])') || rc_tag=""
+        if [ -z "$rc_tag" ]; then
+            echo "ОШИБКА: кандидатов в выпуск (теги v*-rc.N) нет, либо список тегов не поместился в один ответ API." >&2
+            echo "  Канал rc работает только от опубликованного кандидата (fail-closed)." >&2
+            echo "  Дождитесь кандидата от Weekly Release или выберите другой канал (release/main)." >&2
+            exit "$EXIT_NETWORK"
+        fi
+        commit_json=""
+        if commit_json=$(github_api_get "$API_BASE/commits/$rc_tag"); then
+            api_status=0
+        else
+            api_status=$?
+        fi
+        if [ "$api_status" -eq "$GITHUB_API_AUTH_FAILURE" ] || \
+           [ "$api_status" -eq "$GITHUB_API_INVALID_TOKEN" ] || \
+           [ "$api_status" -eq "$GITHUB_API_UNSAFE_CURL_OPTIONS" ]; then
+            echo "ОШИБКА: authenticated rc commit lookup failed; refusing fallback to tag." >&2
+            exit "$EXIT_NETWORK"
+        fi
+        if [ -n "$commit_json" ] && \
+           resolved_ref=$(printf '%s\n' "$commit_json" | "$PY_BIN" -c '
+import json, re, sys
+sha = json.load(sys.stdin).get("sha", "")
+if not re.fullmatch(r"[0-9a-f]{40}", sha):
+    raise SystemExit(1)
+print(sha)'); then
+            RAW_BASE="https://raw.githubusercontent.com/$REPO/$resolved_ref"
+            echo "  Канал поставки: кандидат $rc_tag (снимок ${resolved_ref:0:12})"
+            RELEASE_SHA="$resolved_ref"
+        else
+            # В отличие от release-канала (тег — допустимый пин), rc fail-closed
+            # и здесь: незакреплённый SHA = непроверяемый снимок (cold review).
+            echo "ОШИБКА: не удалось закрепить кандидат $rc_tag по SHA коммита." >&2
+            echo "  Канал rc fail-closed: обновление по подвижному имени тега не выполняется." >&2
+            exit "$EXIT_NETWORK"
+        fi
+        # Устаревший кандидат: релиз той же или более новой версии уже вышел —
+        # тестировщик обязан это видеть, а не молча ставить старый снимок.
+        latest_tag=""
+        if release_json=$(github_api_get "$API_BASE/releases/latest"); then
+            latest_tag=$(printf '%s\n' "$release_json" | \
+                sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+        if [ -z "$latest_tag" ]; then
+            echo "  ⚠ Актуальность кандидата проверить не удалось (releases/latest недоступен или не распознан)." >&2
+        fi
+        if [ -n "$latest_tag" ]; then
+            local _cmp
+            _cmp=$(printf '%s\n%s\n' "$latest_tag" "$rc_tag" | "$PY_BIN" -c '
+import re, sys
+def ver(tag):
+    m = re.match(r"v(\d+)\.(\d+)\.(\d+)", tag)
+    return tuple(int(g) for g in m.groups()) if m else None
+lines = [l.strip() for l in sys.stdin if l.strip()]
+rel, rc = (ver(t) for t in lines[:2])
+print("stale" if rel and rc and rel >= rc else "fresh")')
+            if [ "$_cmp" = "stale" ]; then
+                echo "  ⚠ ВНИМАНИЕ: кандидат $rc_tag устарел — релиз $latest_tag уже опубликован." >&2
+                echo "    Переключитесь на release-канал: IWE_UPDATE_CHANNEL=release bash update.sh" >&2
+            fi
+        fi
+        return 0
+    fi
     if [ "$UPDATE_CHANNEL" = "release" ]; then
         # sed, not python: the tag must be resolvable even on installs where
         # py_available fails — a release tag is already an immutable-enough
@@ -3612,6 +3804,12 @@ fi
 
 # Parse version from manifest
 UPSTREAM_VERSION=$(manifest_version "$MANIFEST")
+# Shown next to upstream so a pilot running the same install on two machines
+# sees at a glance whether they are about to converge or diverge.
+INSTALLED_VERSION=$(manifest_version "$SCRIPT_DIR/update-manifest.json" 2>/dev/null)
+if [ -n "$INSTALLED_VERSION" ]; then
+    echo "  Установленная версия: $INSTALLED_VERSION"
+fi
 echo "  Версия upstream: $UPSTREAM_VERSION"
 echo ""
 
@@ -3649,6 +3847,11 @@ if $CHECK_ONLY && $FAST_CHECK; then
         echo "   Чтобы получить актуальную main, запустите: IWE_UPDATE_CHANNEL=main bash update.sh"
         echo ""
     fi
+
+    # WP-529 Ф220: the "what changes for me" summary needs the release's CHANGELOG.md,
+    # which --fast never downloads; say so instead of staying silent.
+    echo "ℹ Сводка «Главное в этом обновлении» в режиме --fast недоступна: файлы релиза не скачиваются. Полная проверка со сводкой: bash update.sh --check"
+    echo ""
 
     LOCAL_MANIFEST="$SCRIPT_DIR/update-manifest.json"
     LOCAL_VERSION=""
@@ -4754,8 +4957,17 @@ for _dq_i in "${!DOWNLOAD_QUEUE[@]}"; do
                 continue
             fi
         fi
+        COMPARE_FILE="$REMOTE_FILE"
+        if [ "$LOCAL_HASH" != "$REMOTE_HASH" ] && [[ "$fpath" == .claude/skills/*/SKILL.md ]]; then
+            SKILL_USER_SECTION=$(sed -n '/^<!-- USER-SPACE -->/,/^<!-- \/USER-SPACE -->/p' "$SCRIPT_DIR/$fpath")
+            if [ -n "$SKILL_USER_SECTION" ]; then
+                COMPARE_FILE="$TMPDIR_UPDATE/skill-render.tmp"
+                render_skill_with_user_section "$REMOTE_FILE" "$SKILL_USER_SECTION" "$COMPARE_FILE"
+                REMOTE_HASH=$(hash_file "$COMPARE_FILE")
+            fi
+        fi
         if [ "$LOCAL_HASH" != "$REMOTE_HASH" ]; then
-            DIFF_COUNT=$(diff "$SCRIPT_DIR/$fpath" "$REMOTE_FILE" 2>/dev/null | grep -c '^[<>]' || true); DIFF_COUNT=${DIFF_COUNT:-?}
+            DIFF_COUNT=$(diff "$SCRIPT_DIR/$fpath" "$COMPARE_FILE" 2>/dev/null | grep -c '^[<>]' || true); DIFF_COUNT=${DIFF_COUNT:-?}
             UPDATED_FILES+=("$fpath")
             UPDATED_LINES+=("$DIFF_COUNT")
             # issues #965/#967: the version update.sh installed last time, before Step 5 replaces
@@ -4766,6 +4978,7 @@ for _dq_i in "${!DOWNLOAD_QUEUE[@]}"; do
         else
             UNCHANGED=$((UNCHANGED + 1))
         fi
+        [ "$COMPARE_FILE" = "$REMOTE_FILE" ] || rm -f "$COMPARE_FILE"
     fi
 done
 printf "\n"
@@ -4773,6 +4986,7 @@ printf "\n"
 # === Step 2b: Deprecated files (устаревшие L1-файлы к удалению) ===
 DEPRECATED_FOUND=()
 DEPRECATED_REASONS=()
+DEPRECATED_TRACKED_KEPT=()
 
 if is_upstream_git_mirror; then
     echo "  ⚠ Каталог шаблона — git-зеркало с remote upstream: удаление устаревших файлов пропущено. Их должен удалить сам канон."
@@ -4789,6 +5003,13 @@ while IFS='|' read -r fpath freason; do
     # listed the same path under deprecated_files — defeating the guarantee
     # this whole feature exists to give.
     is_fork_owned_path "$fpath" && continue
+    # issue #1010 F9: a path the local template clone still tracks in git is
+    # part of that checkout; deleting it leaves the clone with a tracked
+    # deletion after a clean update. Keep it and say so once.
+    if [ -f "$SCRIPT_DIR/$fpath" ] && git -C "$SCRIPT_DIR" ls-files --error-unmatch -- "$fpath" >/dev/null 2>&1; then
+        DEPRECATED_TRACKED_KEPT+=("$fpath")
+        continue
+    fi
     if [ -f "$SCRIPT_DIR/$fpath" ]; then
         DEPRECATED_FOUND+=("$fpath")
         DEPRECATED_REASONS+=("${freason:-устарел}")
@@ -4813,6 +5034,11 @@ for entry in data.get('deprecated_files', []):
     print(path + '|' + entry.get('reason',''))
 " "$MANIFEST" || true
     fi)
+fi
+
+if [ "${#DEPRECATED_TRACKED_KEPT[@]}" -gt 0 ]; then
+    echo "  ○ Устаревшие по манифесту, но отслеживаются git этой копии шаблона — оставлены: ${DEPRECATED_TRACKED_KEPT[*]}"
+    echo "    Удалить из своей копии: git -C \"$SCRIPT_DIR\" rm -- ${DEPRECATED_TRACKED_KEPT[*]}"
 fi
 
 TOTAL_CHANGES=$(( ${#NEW_FILES[@]} + ${#UPDATED_FILES[@]} + ${#DEPRECATED_FOUND[@]} ))
@@ -4983,6 +5209,11 @@ if [ "$TOTAL_CHANGES" -eq 0 ]; then
     apply_settings_merge_if_requested
     report_author_skip_summary
     report_executable_index_mismatches manifest
+    # WP-7 F267 stage 1: an install with nothing to update still gets its capability record.
+    if ! $CHECK_ONLY && [ -f "$SCRIPT_DIR/scripts/iwe-capabilities.sh" ]; then
+        bash "$SCRIPT_DIR/scripts/iwe-capabilities.sh" probe --announce \
+            || echo "  ⚠ iwe-capabilities.sh не записал состояние (не критично). Повторить: bash $SCRIPT_DIR/scripts/iwe-capabilities.sh probe"
+    fi
     echo "✓ Всё актуально. Обновлений нет. ($UNCHANGED файлов проверено)"
     exit_clean
 fi
@@ -5037,7 +5268,7 @@ if [ ${#UPDATED_FILES[@]} -gt 0 ]; then
 fi
 
 if [ ${#DEPRECATED_FOUND[@]} -gt 0 ]; then
-    echo "Устаревшие файлы к удалению (${#DEPRECATED_FOUND[@]}):"
+    echo "Устаревшие файлы — будут перенесены в резервную копию .backups/deprecated/ (${#DEPRECATED_FOUND[@]}):"
     for i in "${!DEPRECATED_FOUND[@]}"; do
         f="${DEPRECATED_FOUND[$i]}"
         r="${DEPRECATED_REASONS[$i]}"
@@ -5071,6 +5302,69 @@ fi
 if $CHECK_ONLY; then
     echo "Режим --check: изменения не применяются."
     echo "Для применения: bash update.sh"
+
+    # WP-529 Ф220: --dry-run-strict проверяет уже вычисленный план доставки
+    # (NEW_FILES/UPDATED_FILES этого прогона), а не повторно парсит текст
+    # update.sh — пир-сессия 2026-10-22-04-wp529-continue-items, возражение
+    # Codex на предложение Kimi (парсинг текста скрипта — хрупкое дублирование
+    # логики). CHECK_ONLY завершается здесь, до Step 5, поэтому это отдельный
+    # проверочный проход, не ветка внутри apply-циклов.
+    # BEGIN-TESTABLE: dry-run-strict-check
+    if $STRICT_CHECK; then
+        STRICT_FAILURES=()
+        for f in "${NEW_FILES[@]}" "${UPDATED_FILES[@]}"; do
+            case "$f" in
+                /*|*..*) STRICT_FAILURES+=("$f: путь выходит за пределы установки") ;;
+            esac
+            [ -f "$TMPDIR_UPDATE/files/$f" ] || STRICT_FAILURES+=("$f: отсутствует в загруженном плане доставки")
+        done
+        if [ "${#STRICT_FAILURES[@]}" -gt 0 ]; then
+            echo ""
+            echo "🔴 --dry-run-strict: план доставки не прошёл структурную проверку:"
+            for reason in "${STRICT_FAILURES[@]}"; do
+                echo "  - $reason"
+            done
+            exit "$EXIT_RUNTIME"
+        fi
+        echo "--dry-run-strict: план доставки (${#NEW_FILES[@]} новых + ${#UPDATED_FILES[@]} обновляемых) структурно корректен. Это не гарантирует отсутствие регрессий в поведении после apply."
+    fi
+    # END-TESTABLE: dry-run-strict-check
+
+    # BEGIN-TESTABLE: changelog-check-preview
+    # WP-529 Ф220 (вопрос пилота 2: «что я получу, до установки»): сводка «Главное в
+    # этом обновлении» раньше печаталась только после apply. Файлы релиза уже
+    # скачаны в $TMPDIR_UPDATE/files/ (скачиваются только изменённые), поэтому дифф
+    # локального и нового CHANGELOG.md доступен здесь. Только печать: код выхода
+    # проверки не зависит от этого блока. Правило выбора пунктов (не [optional],
+    # немаркированная строка значима) то же, что в блоке changelog-diff-disclaimer
+    # ниже; при правке одного блока сверить другой.
+    CHANGELOG_NEW_FILE="$TMPDIR_UPDATE/files/CHANGELOG.md"
+    if [ ! -f "$CHANGELOG_NEW_FILE" ]; then
+        echo ""
+        echo "ℹ Сводка «Главное в этом обновлении» недоступна: CHANGELOG.md в этом выпуске не менялся, не входит в план доставки или не скачался (смотрите предупреждения о загрузке выше)."
+    elif [ ! -f "$SCRIPT_DIR/CHANGELOG.md" ]; then
+        # No local CHANGELOG.md (first install): diffing against nothing would list every
+        # item of every past version as "new", which is noise, not a summary.
+        echo ""
+        echo "ℹ Сводка «Главное в этом обновлении» не строится: у вас ещё нет CHANGELOG.md (первая установка), сравнивать не с чем. Полный список изменений - в CHANGELOG.md после установки."
+    else
+        CHANGELOG_OLD_TEXT=""
+        [ -f "$SCRIPT_DIR/CHANGELOG.md" ] && CHANGELOG_OLD_TEXT=$(cat "$SCRIPT_DIR/CHANGELOG.md")
+        CHANGELOG_NEW_TEXT=$(cat "$CHANGELOG_NEW_FILE")
+        PREVIEW_ADDED=$(diff <(printf '%s\n' "$CHANGELOG_OLD_TEXT") <(printf '%s\n' "$CHANGELOG_NEW_TEXT") | grep '^>' | sed 's/^> //') || true
+        PREVIEW_HIGHLIGHTS=$(printf '%s\n' "$PREVIEW_ADDED" | grep '^- ' | grep -v '^- \[optional\]') || true
+        echo ""
+        if [ -n "$PREVIEW_HIGHLIGHTS" ]; then
+            echo "Главное в этом обновлении (то, что вы получите после установки):"
+            printf '%s\n' "$PREVIEW_HIGHLIGHTS" | sed 's/^/  + /'
+        elif [ -n "$PREVIEW_ADDED" ]; then
+            echo "В CHANGELOG.md нового выпуска есть только необязательные пункты ([optional]); значимых изменений нет."
+        else
+            echo "ℹ Сводка «Главное в этом обновлении» недоступна: в CHANGELOG.md нового выпуска нет добавленных пунктов."
+        fi
+    fi
+    # END-TESTABLE: changelog-check-preview
+
     assert_self_unmutated
     if ! run_sync_canary; then
         exit "$EXIT_CANARY_FAILED"
@@ -5122,6 +5416,14 @@ echo "Применяю обновления..."
 require_env_before_update
 begin_update_transaction
 remember_untouched_memory_before_apply
+
+# WP-529 Ф220: снимок CHANGELOG.md до перезаписи — источник для дифа и
+# дисклеймера после apply-циклов ниже. Снимаем содержимым файла (не git-тегом):
+# тег текущей ревизии не доказывает, какая версия была установлена у
+# пользователя до этого запуска, и может отсутствовать вовсе (пир-сессия
+# 2026-10-22-02-wp529-peer-continue, предложение Codex принято над git tag от Kimi).
+CHANGELOG_SNAPSHOT=""
+[ -f "$SCRIPT_DIR/CHANGELOG.md" ] && CHANGELOG_SNAPSHOT=$(cat "$SCRIPT_DIR/CHANGELOG.md")
 
 APPLIED=0
 REMOVED=0
@@ -5283,13 +5585,11 @@ for f in "${UPDATED_FILES[@]}"; do
         else
             USER_SECTION=""
         fi
-        cp "$TMPDIR_UPDATE/files/$f" "$SCRIPT_DIR/$f"
         if [ -n "$USER_SECTION" ]; then
-            perl -i -0pe 's/^<!-- USER-SPACE -->.*?^<!-- \/USER-SPACE -->//ms' "$SCRIPT_DIR/$f"
-            perl -i -0pe 's/\n+$/\n/' "$SCRIPT_DIR/$f"
-            printf '\n%s\n' "$USER_SECTION" >> "$SCRIPT_DIR/$f"
+            render_skill_with_user_section "$TMPDIR_UPDATE/files/$f" "$USER_SECTION" "$SCRIPT_DIR/$f"
             echo "  ~ $f (USER-SPACE preserved)"
         else
+            cp "$TMPDIR_UPDATE/files/$f" "$SCRIPT_DIR/$f"
             echo "  ~ $f"
         fi
     else
@@ -5300,6 +5600,47 @@ for f in "${UPDATED_FILES[@]}"; do
     fi
     APPLIED=$((APPLIED + 1))
 done
+
+# BEGIN-TESTABLE: changelog-diff-disclaimer
+# WP-529 Ф220: диф и дисклеймер CHANGELOG.md — только если содержимое реально
+# изменилось (не на каждом прогоне). Решение зафиксировано пир-сессией
+# 2026-10-22-02-wp529-peer-continue + продолжением 2026-10-22-04: --check/--dry-run
+# не гарантирует отсутствие регрессий после настоящего обновления — честное
+# предупреждение здесь закрывает только "не знал, что изменилось", не сам риск
+# регрессии (его закрывает --dry-run-strict выше).
+if [ -n "$CHANGELOG_SNAPSHOT" ] && [ ! -f "$SCRIPT_DIR/CHANGELOG.md" ]; then
+    # Cold-review (2026-10-22): существовал до apply, пропал после (removal,
+    # не UPDATED_FILES) — редкий путь (CHANGELOG.md сейчас ни в одном списке
+    # удаления), но диф без этой ветки был бы тихо пропущен, хотя контент
+    # содержательно изменился (на "отсутствует").
+    echo ""
+    echo "⚠ CHANGELOG.md был удалён этим обновлением (ранее присутствовал)."
+elif [ -f "$SCRIPT_DIR/CHANGELOG.md" ]; then
+    CHANGELOG_AFTER=$(cat "$SCRIPT_DIR/CHANGELOG.md")
+    if [ "$CHANGELOG_AFTER" != "$CHANGELOG_SNAPSHOT" ]; then
+        # WP-529 Ф220 продолжение (2026-10-22, "слой зачем"): выделить значимые
+        # пункты (не [optional]) впереди полного дифа — переиспользует уже
+        # существующую классификацию Changelog-Tag (CLAUDE.md: security/
+        # migration/behavior/optional), не вводит новый слой авторства записей.
+        # Немаркированная строка тоже считается значимой (CLAUDE.md:
+        # «отсутствие метки не означает безопасно»).
+        ADDED_LINES=$(diff <(printf '%s\n' "$CHANGELOG_SNAPSHOT") <(printf '%s\n' "$CHANGELOG_AFTER") | grep '^>' | sed 's/^> //')
+        HIGHLIGHTS=$(printf '%s\n' "$ADDED_LINES" | grep '^- ' | grep -v '^- \[optional\]') || true
+        if [ -n "$HIGHLIGHTS" ]; then
+            echo ""
+            echo "Главное в этом обновлении:"
+            printf '%s\n' "$HIGHLIGHTS" | sed 's/^/  + /'
+        fi
+        echo ""
+        echo "Изменения в CHANGELOG.md:"
+        # [ -n ] перед печатью — иначе пустой $ADDED_LINES (diff только удалял,
+        # ничего не добавил) печатает одну паразитную строку "  + " (cold-review).
+        [ -n "$ADDED_LINES" ] && printf '%s\n' "$ADDED_LINES" | sed 's/^/  + /'
+        echo ""
+        echo "⚠ Чистый --check/--dry-run не гарантирует отсутствие регрессий после этого обновления — он проверяет совпадение файлов, не поведение. Для структурной проверки плана доставки используйте --dry-run-strict."
+    fi
+fi
+# END-TESTABLE: changelog-diff-disclaimer
 
 # issue #229: hard-require frontmatter.sh now — NEW_FILES/UPDATED_FILES above have
 # just delivered it to disk if this is the first run after upgrading from a
@@ -5337,28 +5678,118 @@ if [ "$CLAUDE_CONFLICTS" -gt 0 ]; then
     CLAUDE_CONFLICT_FILES+=("$SCRIPT_DIR/CLAUDE.md")
 fi
 
-# Remove deprecated files
+# Deprecated files are never deleted outright (issue #1010 F9 follow-up): each
+# one is MOVED into a per-run backup directory, so a file the manifest wrongly
+# retired, or a local edit to it, can be restored by hand. Layout of one run:
+#   $WORKSPACE_DIR/.backups/deprecated/<UTC timestamp>-<pid>/
+#     template/<rel>             the file from SCRIPT_DIR (local template clone)
+#     workspace/<rel>            its propagated copy under $WORKSPACE_DIR/.claude/
+#     memory/<rel without memory/>  its copy in the Claude memory dir
+# Old run directories are deliberately never rotated: a backup that update.sh
+# deletes on its own would defeat the purpose of keeping it.
+DEPRECATED_BACKUP_DIR="$WORKSPACE_DIR/.backups/deprecated/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+# physical_dir DIR — print DIR with every symlink resolved; fails if DIR is missing.
+physical_dir() {
+    (cd -P "$1" 2>/dev/null && pwd -P)
+}
+
+# move_deprecated_to_backup ROOT REL KIND DISPLAY — move ROOT/REL to
+# $DEPRECATED_BACKUP_DIR/KIND/REL and print one line naming DISPLAY. Returns 1 and
+# leaves the file in place (with a warning) when the move is not provably safe or
+# fails; never aborts the run.
+# Symlinks: the LINK itself is moved, never its target. The old code rm'ed the
+# link (target untouched); moving it is the reversible equivalent and still reads
+# or writes nothing outside ROOT. What must resolve inside ROOT is the directory
+# that holds the entry — a symlinked parent directory would move a file that
+# lives outside ROOT, so that case is refused.
+move_deprecated_to_backup() {
+    local root="$1" rel="$2" kind="$3" display="$4"
+    local src="$root/$rel" dest="$DEPRECATED_BACKUP_DIR/$kind/$rel"
+    local root_real parent_real dest_parent_real
+    case "/$rel/" in
+        //|*/../*|*/./*|*//*)
+            echo "  ⚠ $display: недопустимый путь в манифесте, файл оставлен на месте." >&2
+            return 1 ;;
+    esac
+    root_real=$(physical_dir "$root") && parent_real=$(physical_dir "$(dirname "$src")") || {
+        echo "  ⚠ $display: каталог файла недоступен, файл оставлен на месте." >&2
+        return 1
+    }
+    case "$parent_real/" in
+        "$root_real"/*) ;;
+        *)
+            echo "  ⚠ $display: каталог файла ведёт за пределы $root (символическая ссылка), файл оставлен на месте." >&2
+            return 1 ;;
+    esac
+    if [ -L "$WORKSPACE_DIR/.backups" ] || [ -L "$WORKSPACE_DIR/.backups/deprecated" ]; then
+        echo "  ⚠ $display: каталог резервных копий .backups — символическая ссылка, файл оставлен на месте." >&2
+        return 1
+    fi
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        echo "  ⚠ $display: в резервной копии уже есть $dest, не перезаписываю — файл оставлен на месте." >&2
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$dest")" 2>/dev/null \
+       || ! dest_parent_real=$(physical_dir "$(dirname "$dest")"); then
+        echo "  ⚠ $display: не удалось создать каталог резервной копии $(dirname "$dest"), файл оставлен на месте." >&2
+        return 1
+    fi
+    case "$dest_parent_real/" in
+        "$(physical_dir "$DEPRECATED_BACKUP_DIR")"/*) ;;
+        *)
+            echo "  ⚠ $display: каталог резервной копии ведёт за пределы $DEPRECATED_BACKUP_DIR, файл оставлен на месте." >&2
+            return 1 ;;
+    esac
+    if ! mv -- "$src" "$dest" 2>/dev/null; then
+        echo "  ⚠ $display: не удалось перенести в резервную копию $DEPRECATED_BACKUP_DIR, файл оставлен на месте." >&2
+        return 1
+    fi
+    # Template files head the list; their propagated copies are indented below.
+    local indent="  "
+    [ "$kind" = template ] || indent="    "
+    echo "${indent}- $display (устарел, перенесён в резервную копию: $DEPRECATED_BACKUP_DIR)"
+}
+
+# remove_propagated_copies REL — move away the copies of a deprecated template
+# file that update.sh propagated out of SCRIPT_DIR: workspace .claude/ (L1 files)
+# and the Claude memory dir (relative path from memory/, not basename,
+# symmetric with repair_pass() delivery, issue #287).
+remove_propagated_copies() {
+    local f="$1" mem_rel
+    case "$f" in .claude/*)
+        if [ -f "$WORKSPACE_DIR/$f" ] || [ -L "$WORKSPACE_DIR/$f" ]; then
+            move_deprecated_to_backup "$WORKSPACE_DIR" "$f" workspace "$WORKSPACE_DIR/$f" || true
+        fi
+        ;;
+    esac
+    case "$f" in memory/*.md|memory/*.yaml|memory/*.yml)
+        mem_rel="${f#memory/}"
+        if [ -n "${CLAUDE_MEMORY_DIR:-}" ] && \
+           { [ -f "$CLAUDE_MEMORY_DIR/$mem_rel" ] || [ -L "$CLAUDE_MEMORY_DIR/$mem_rel" ]; }; then
+            move_deprecated_to_backup "$CLAUDE_MEMORY_DIR" "$mem_rel" memory "$CLAUDE_MEMORY_DIR/$mem_rel" || true
+        fi
+        ;;
+    esac
+    return 0
+}
+
+# Move deprecated files into the run's backup directory
 for i in "${!DEPRECATED_FOUND[@]}"; do
     f="${DEPRECATED_FOUND[$i]}"
     fpath="$SCRIPT_DIR/$f"
-    if [ -f "$fpath" ]; then
-        rm "$fpath"
-        echo "  - $f (удалён: устарел)"
-        REMOVED=$((REMOVED + 1))
-        # Also remove from workspace .claude/ (propagated L1 files)
-        case "$f" in .claude/*)
-            ws_path="$WORKSPACE_DIR/$f"
-            [ -f "$ws_path" ] && rm "$ws_path" && echo "    (также из workspace)"
-            ;;
-        esac
-        # Also remove from Claude memory dir (memory/* files) — relative path from
-        # memory/ (not basename), symmetric with repair_pass() delivery (issue #287).
-        case "$f" in memory/*.md|memory/*.yaml|memory/*.yml)
-            mem_path="$CLAUDE_MEMORY_DIR/${f#memory/}"
-            [ -f "$mem_path" ] && rm "$mem_path" && echo "    (также из memory/)"
-            ;;
-        esac
+    if [ -f "$fpath" ] || [ -L "$fpath" ]; then
+        if move_deprecated_to_backup "$SCRIPT_DIR" "$f" template "$f"; then
+            REMOVED=$((REMOVED + 1))
+            remove_propagated_copies "$f"
+        fi
     fi
+done
+# issue #1010 F9: the template clone keeps a git-tracked deprecated file, but
+# its propagated copies are not part of that checkout and still go — otherwise
+# a deprecated skill/hook/rule stayed active in the workspace forever.
+for f in ${DEPRECATED_TRACKED_KEPT[@]+"${DEPRECATED_TRACKED_KEPT[@]}"}; do
+    remove_propagated_copies "$f"
 done
 # Clean up empty deprecated directories
 for i in "${!DEPRECATED_FOUND[@]}"; do
@@ -5668,9 +6099,7 @@ for f in "${NEW_FILES[@]}" "${UPDATED_FILES[@]}"; do
             fi
             # 5. Reinject USER_SECTION
             if [ -n "$USER_SECTION" ]; then
-                perl -i -0pe 's/^<!-- USER-SPACE -->.*?^<!-- \/USER-SPACE -->//ms' "$dst"
-                perl -i -0pe 's/\n+$/\n/' "$dst"
-                printf '\n%s\n' "$USER_SECTION" >> "$dst"
+                reinject_user_section "$dst" "$USER_SECTION"
                 echo "  ✓ $f → workspace (USER-SPACE preserved)"
             else
                 echo "  ✓ $f → workspace"
@@ -6451,7 +6880,7 @@ fi
 echo ""
 echo "=========================================="
 SUMMARY_MSG="  Обновление завершено ($APPLIED файлов"
-[ "$REMOVED" -gt 0 ] && SUMMARY_MSG="$SUMMARY_MSG, $REMOVED удалено"
+[ "$REMOVED" -gt 0 ] && SUMMARY_MSG="$SUMMARY_MSG, $REMOVED устаревших перенесено в резервную копию"
 SUMMARY_MSG="$SUMMARY_MSG)"
 echo "$SUMMARY_MSG"
 if [ "${AUTHOR_SKIPPED:-0}" -gt 0 ]; then
@@ -6462,6 +6891,46 @@ report_author_skip_summary
 echo "=========================================="
 echo ""
 echo "Перезапустите Claude Code для применения обновлений в memory/."
+
+# issue #1280 (WP-561 Ф46 tail, 22.10): update.sh never commits its own
+# delivery into the governance repo (it only copies files there -- see the
+# backfill_* functions above) -- that commit is always a separate, later
+# action by the pilot or an agent on their behalf. When the canonical
+# checkout is frozen (WP-520, default on), that later `git commit` is exactly
+# the direct write the freeze gate exists to block, with no WP to bind it to
+# (community report, issue #1280; peer-session 2026-10-22-17, Claude+Kimi+
+# Codex). `update-delivery` is now an allowed housekeeping reason (same
+# closed whitelist as day/week/month-close, session-open-gate.sh).
+# The hint stages only what this run delivers into the governance repo
+# (backfill_* write scripts/ and .githooks/), never `git add -A`, which would
+# also sweep the operator's unrelated edits (issue #1280 follow-up). No
+# --canonical-owner: the housekeeping branch of session-guard.sh exits before
+# it is read, and no exclusive-owner refusal exists there.
+GOVERNANCE_REPO_FOR_DELIVERY_HINT=$(effective_governance_repo 2>/dev/null) || GOVERNANCE_REPO_FOR_DELIVERY_HINT=""
+if [ -n "$GOVERNANCE_REPO_FOR_DELIVERY_HINT" ]; then
+    GOVERNANCE_DIR_FOR_DELIVERY_HINT="$WORKSPACE_DIR/$GOVERNANCE_REPO_FOR_DELIVERY_HINT"
+    if [ -d "$GOVERNANCE_DIR_FOR_DELIVERY_HINT/.git" ]; then
+        echo ""
+        echo "Если $GOVERNANCE_REPO_FOR_DELIVERY_HINT нужно закоммитить (канонический чекаут может быть заморожен, WP-520):"
+        # Путь к session-guard.sh — из ТОЛЬКО ЧТО ОБНОВЛЁННОГО шаблона ($SCRIPT_DIR/scripts),
+        # не из governance-репо: туда update.sh session-guard.sh не доставляет, и подсказка
+        # с governance-путём падает на community-установке сразу (issue #1280, находка из
+        # живого разбора 25.10). --agent раскрывается в сессии оператора, а не при
+        # прогоне update.sh: строка печатается с экранированным \${IWE_AGENT...}, иначе
+        # прогон из обычного терминала запекал бы чужое/пустое имя (peer-находка WP-7 Ф259).
+        # страж open-gate матчит семафоры только вида ${IWE_AGENT}-*.open.
+        DELIVERY_PATHS_FOR_HINT="scripts"
+        # Only when git already tracks it: an untracked or ignored .githooks/
+        # makes `git add`/`git commit -- .githooks` fail and stops the chain.
+        [ -n "$(git -C "$GOVERNANCE_DIR_FOR_DELIVERY_HINT" ls-files -- .githooks 2>/dev/null)" ] \
+            && DELIVERY_PATHS_FOR_HINT="scripts .githooks"
+        echo "  bash \"$SCRIPT_DIR/scripts/session-guard.sh\" open --housekeeping update-delivery --agent \"\${IWE_AGENT:-claude-code}\""
+        echo "  (cd \"$GOVERNANCE_DIR_FOR_DELIVERY_HINT\" && git add -- $DELIVERY_PATHS_FOR_HINT && git diff --cached --name-only && git commit -m \"chore: sync template update\" -- $DELIVERY_PATHS_FOR_HINT)"
+        echo "  bash \"$SCRIPT_DIR/scripts/session-guard.sh\" close --housekeeping update-delivery --agent \"\${IWE_AGENT:-claude-code}\""
+        echo "  Стейджатся только пути доставки ($DELIVERY_PATHS_FOR_HINT); остальные незакоммиченные правки в $GOVERNANCE_REPO_FOR_DELIVERY_HINT останутся как были."
+        echo "  Важно: open, commit и close выполняй внутри ОДНОЙ сессии агента — страж привязывает семафор к её harness_session_id; open из обычного терминала с последующим commit из сессии агента пропущен не будет (issue #1280)."
+    fi
+fi
 
 # issue #226: остальная доставка (memory/hooks/skills, repair-pass, коммит) уже
 # выполнена выше независимо от конфликта — теперь сообщаем и выходим с ошибкой,
@@ -6503,6 +6972,13 @@ fi
 if $CLAUDE_CONFLICT_DETECTED || [ "${#CLAUDE_BASE_MISSING_FILES[@]}" -gt 0 ] || [ "${#CLAUDE_SILENT_LOSS_FILES[@]}" -gt 0 ] \
     || [ "${#CLAUDE_MERGE_FAILED_FILES[@]}" -gt 0 ]; then
     exit "$EXIT_CONFLICT"
+fi
+
+# WP-7 F267 stage 1: refresh the record of what this installation has (programs, gateway,
+# backup target) after the files are in place. Best effort: never changes the update result.
+if [ -f "$SCRIPT_DIR/scripts/iwe-capabilities.sh" ]; then
+    bash "$SCRIPT_DIR/scripts/iwe-capabilities.sh" probe --announce \
+        || echo "  ⚠ iwe-capabilities.sh не записал состояние (не критично). Повторить: bash $SCRIPT_DIR/scripts/iwe-capabilities.sh probe"
 fi
 
 finish_update_transaction

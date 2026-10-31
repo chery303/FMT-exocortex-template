@@ -404,7 +404,13 @@ else
                 PROMOTED_DRIFT=$((PROMOTED_DRIFT + 1))
             fi
             if [ $((present & 1)) -eq 1 ] && [ "$seed_ok" = 0 ]; then
-                echo "- ⚠️ \`seed/strategy/scripts/$rel\` отстал от \`scripts/$rel\` — обновить снимок: \`bash \"$IWE_ROOT/FMT-exocortex-template/scripts/check-seed-drift.sh\" --fix\`"
+                # check-seed-drift.sh --fix only rebuilds snapshots that carry the
+                # marker; advising it for an unmarked one changed nothing (#1350).
+                if grep -qF "$SEED_SNAPSHOT_MARKER" "$seed_f"; then
+                    echo "- ⚠️ \`seed/strategy/scripts/$rel\` отстал от \`scripts/$rel\` — обновить снимок: \`bash \"$IWE_ROOT/FMT-exocortex-template/scripts/check-seed-drift.sh\" --fix\`"
+                else
+                    echo "- ⚠️ \`seed/strategy/scripts/$rel\` отстал от \`scripts/$rel\` и не несёт маркер SNAPSHOT — \`check-seed-drift.sh --fix\` такой файл не обновляет; обновить шаблон (\`update.sh\`) или сообщить об устаревшем снимке в issue шаблона"
+                fi
                 PROMOTED_DRIFT=$((PROMOTED_DRIFT + 1))
             fi
             if [ "$present" = 3 ] && [ "$inst_ok" = 1 ] && [ "$seed_ok" = 1 ]; then
@@ -903,6 +909,63 @@ else
     else
         echo "✅ Все репо имеют корректного владельца .git/."
     fi
+fi
+echo ""
+
+# ---------- 8. Capabilities (WP-7 F267 stage 1) ----------
+#
+# Reads what scripts/iwe-capabilities.sh recorded; it checks nothing itself, so the
+# audit and the scripts can never disagree about the same fact. Written at install
+# and update, or by hand: bash scripts/iwe-capabilities.sh probe.
+
+echo "## 8. Возможности установки"
+echo ""
+
+# shellcheck source=lib/iwe-capabilities.sh
+source "$SCRIPT_DIR/lib/iwe-capabilities.sh"
+if [ "$(cap_status os)" = "unknown" ]; then
+    echo "_Возможности ещё не определены. Определить: \`bash scripts/iwe-capabilities.sh probe\` (то же делают установка и обновление)._"
+else
+    echo "| Возможность | Состояние | Значение | Проверено |"
+    echo "|---|---|---|---|"
+    for cap_name in $CAP_NAMES; do
+        printf '| %s | %s | %s | %s |\n' "$cap_name" "$(cap_status "$cap_name")" \
+            "$(cap_field "$cap_name" value 2>/dev/null || true)" "$(cap_field "$cap_name" checked_at 2>/dev/null || true)"
+    done
+    echo ""
+    case "$(cap_status backup)" in
+        undecided)
+            # A yellow line, not a counted warning: "undecided" must not turn the audit's
+            # exit code into an alarm for every install that never chose a backup.
+            echo "⚠️ Бэкап не решён: в \`params.yaml\` нет \`backup_dir\`, а iCloud по умолчанию есть только на macOS. Это не влияет на код выхода аудита. Включить: задайте \`backup_dir\`; отказаться явно: \`backup_enabled: false\`."
+            ;;
+        configured)
+            echo "✅ Бэкап настроен: цель — \`${IWE_ICLOUD_BACKUP_DIR:-}\`."
+            ;;
+        off)
+            echo "ℹ️ Бэкап выключен явно (\`backup_enabled: false\`)."
+            ;;
+    esac
+    # Stage 2: the engine of the backup contract and what disappeared. Yellow lines only:
+    # they never change the audit's exit code.
+    case "$(cap_backup_engine)" in
+        invalid)
+            echo "⚠️ Недопустимое значение \`backup_engine\` в \`params.yaml\`: допустимо \`tar\` (по умолчанию) или \`restic\`. Бэкап не запустится, пока значение не исправлено. Это не влияет на код выхода аудита."
+            ;;
+        restic)
+            echo "ℹ️ Движок бэкапа: restic (защитное хранилище \`~/.iwe-backup/protect-repo\`)."
+            if [ -n "$(cap_backup_dir_param)" ]; then
+                echo "ℹ️ \`backup_dir\` относится к архивам tar и для restic не используется: снимки пишутся в защитное хранилище, не в \`backup_dir\`."
+            fi
+            ;;
+        tar)
+            [ "$(cap_status backup)" = configured ] && echo "ℹ️ Движок бэкапа: tar (архивы в \`backup_dir\` или в iCloud на macOS)."
+            ;;
+    esac
+    cap_regressions | while read -r reg_name reg_was reg_status; do
+        [ -n "$reg_name" ] || continue
+        echo "⚠️ Пропала возможность \`$reg_name\` (была: $reg_was, сейчас: $reg_status). Это не влияет на код выхода аудита."
+    done
 fi
 echo ""
 

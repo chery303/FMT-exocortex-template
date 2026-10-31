@@ -15,6 +15,19 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
+# An unresolved conflict leaves each conflicted path in the index at stages
+# 1/2/3 with no stage 0 — plain `git ls-files` below lists such a path once
+# per stage (3x), and every stage-3 duplicate silently became a manifest
+# entry (found via 3 real CI failures on PR #1296/#1297, 2026-10-21: the
+# duplicate CHANGELOG.md entries broke scripts/verify-manifest.sh). Fail
+# before generating rather than ship a corrupt manifest.
+UNMERGED=$(git -C "$SCRIPT_DIR" diff --name-only --diff-filter=U)
+if [ -n "$UNMERGED" ]; then
+    echo "ERROR: незавершённый конфликт слияния — запустите generate-manifest.sh после git add/rebase --continue:" >&2
+    echo "$UNMERGED" >&2
+    exit 1
+fi
+
 echo "Генерация манифеста v$VERSION..."
 
 # === Исключения, которые НЕ попадают ни в files, ни в excluded_paths ===
@@ -166,6 +179,7 @@ PLATFORM_HOOKS_EXPLICIT_INCLUDE=(
     "seed/strategy/scripts/day-open-ledger-render-patch.py"
     "seed/strategy/scripts/day-open-multiplier-backfill-patch.py"
     "seed/strategy/scripts/day-open-priorities-patch.py"
+    "seed/strategy/scripts/day-open-sync-banner-patch.py"  # stale-input banner step 4.58 (#1245)
     "seed/strategy/scripts/day-open-version-check-patch.py"
     "seed/strategy/scripts/ledger-append.sh"
     "seed/strategy/scripts/llm-proxy-launcher.sh"
@@ -257,6 +271,9 @@ SCRIPT_CONTRACT_EXPLICIT_INCLUDE=(
     "scripts/tests/run-issue-tests.sh"
     "scripts/tests/test_issue_1032_strategy_session_offline.sh"
     "scripts/tests/test_issue_1032_windows_fail_closed.sh"
+    # The delivered #1257 test invokes this verifier regression suite.
+    "scripts/tests/check-wp-registered-smoke.sh"
+    "scripts/tests/test_issue_1257_wp_registration.sh"
     "scripts/tests/test_issue_434_pipeline_scaffold_only.sh"
     "scripts/tests/test_issue_453_calendar_private_visibility.sh"
     "scripts/tests/test_issue_455_scaffold_missing_lib_fatal.sh"

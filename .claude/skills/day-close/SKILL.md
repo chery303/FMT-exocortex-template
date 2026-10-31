@@ -42,6 +42,23 @@ Day Close = протокол. Блокирующее требование — н
 Проверить `day_open.strategy_day` в `day-rhythm-config.yaml` (тот же ключ, что читает `/day-open`, по умолчанию `monday`) против дня недели сегодня. Симметрично `/day-open` (SKILL.md шаг 4: «Если `strategy_day` → DayPlan НЕ создавать»): в стратегический день `current/DayPlan <дата>.md` не создавался — шаги 1, 2b, 3, 9a **неприменимы** (не FAIL), см. пометки внутри них. Итоги дня идут только в WeekReport (шаг 9b), как и предписывает § ниже.
 <!-- Детали: day-close-details.md § Шаг 0в -->
 
+### 0г. Session-guard: привязка к РП-1 (S-68 — каждый коммит обязан нести реальный РП)
+Day Close сам по себе не рабочий продукт, но `session-open-gate.sh` (S-68) не делает для него исключения — финальный коммит шага 3 ниже без привязки к `--wp` будет отклонён. Если сессия уже привязана к другому РП, вторая привязка не нужна:
+```bash
+HARNESS_ID="${CLAUDE_CODE_SESSION_ID:-}"
+SESSION_DIR="${IWE_ROOT:-$HOME/IWE}/.iwe-runtime/sessions"
+AGENT="${IWE_AGENT:-claude-code}"
+ALREADY_BOUND=0
+if [ -n "$HARNESS_ID" ]; then
+  while IFS= read -r sem; do
+    [ -z "$sem" ] && continue
+    grep -qE '^wp: .+' "$sem" 2>/dev/null && { ALREADY_BOUND=1; break; }
+  done < <(grep -lxF "harness_session_id: $HARNESS_ID" "$SESSION_DIR/${AGENT}"-*.open 2>/dev/null)
+fi
+[ "$ALREADY_BOUND" = 1 ] || bash "${IWE_SCRIPTS:-$HOME/IWE/scripts}/session-guard.sh" open --housekeeping day-close --agent "$AGENT" 2>&1 || true
+```
+`session-open-gate.sh` принимает `housekeeping: day-close` как легитимную привязку — это закрытый список из 4 операционных протоколов, не произвольная причина (S-68 запрещает именно произвольные `--housekeeping`-обходы, не эти четыре). Отказ открытия (коллизия с параллельной сессией) не блокирует протокол.
+
 ### 1. Сбор данных
 **Strategy_day (шаг 0в) → неприменимо, пропустить** (нет DayPlan, сверять таблицу «На сегодня» не с чем). Иначе: запустить bash-скрипт сбора коммитов за день по всем git-репо в `${IWE_WORKSPACE:-$HOME/IWE}/`. Сопоставить с таблицей «На сегодня» из DayPlan → определить статусы.
 <!-- Детали: day-close-details.md § Шаг 1 -->
@@ -50,7 +67,7 @@ Day Close = протокол. Блокирующее требование — н
 **2a.** WeekPlan (`current/Plan W{N}...`): обновить статусы РП — grep по номеру РП, обновить ВСЕ упоминания.
 **2b.** **Strategy_day (шаг 0в) → неприменимо, пропустить** (DayPlan не создавался). Иначе: DayPlan `current/DayPlan YYYY-MM-DD.md`: статусы ВСЕХ строк (РП + ad-hoc). Done → зачеркнуть.
 **2c.** `docs/WP-REGISTRY.md`: статусы + даты.
-**2d.** `inbox/open-sessions.log`: удалить строки закрытых сессий.
+**2d.** `inbox/open-sessions.log` — накопительный журнал открытий (`session-guard.sh open` только дописывает строку; аудит и сбор метрик считают историю): строки **не удалять**. Сверить сессии сегодняшнего дня с журналами сессий; зависшие семафоры закрывать через `session-guard.sh close`, а не правкой журнала (issue #1266).
 **2e.** Новые репо/сервисы за день? → REPOSITORY-REGISTRY, navigation.md, MAP.002.
 **2f.** WeekReport — сначала `bash "${IWE_SCRIPTS:-$HOME/IWE/scripts}/week-report-ensure.sh"` (issue #886: создаёт парный каркас `WeekReport W{N} YYYY-MM-DD.md`, если файла ещё нет, и ничего не трогает, если он есть), затем: добавить `<details><summary><b>Итоги {День} {Дата}</b></summary>` **перед** предыдущими итогами (обратная хронология).
 <!-- Детали 2f: day-close-details.md § Шаг 2f -->
@@ -75,7 +92,7 @@ Day Close = протокол. Блокирующее требование — н
 <!-- Детали: day-close-details.md § Шаг 4в -->
 
 ### 4. Lesson Hygiene
-Просмотреть «Уроки» в MEMORY.md. Не применялся >1 нед и есть в `lessons_*.md` → удалить. Новый урок → строка в MEMORY.md + `lessons_*.md`. Цель: ≤8 уроков.
+`IWE_PATHS="${IWE_PATHS_FILE:-}"; if [ -z "$IWE_PATHS" ]; then for _c in "$PWD/.iwe-paths" "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths" "$HOME/.iwe-paths"; do [ -r "$_c" ] && { IWE_PATHS="$_c"; break; }; done; fi; [ -n "$IWE_PATHS" ] && . "$IWE_PATHS" 2>/dev/null; T="${IWE_TEMPLATE:-$HOME/IWE/FMT-exocortex-template}"; bash "$T/scripts/memory-bleed.sh" --hot-only` — HOT-лимит памяти (issue #1314: прежний текст ссылался на несуществующую секцию «Уроки» в MEMORY.md и на `lessons_*.md` по имени файла; современная схема — frontmatter `type`/`horizon`/`status`, `memory/memory-lifecycle-spec.md`). Превышен → перевести часть файлов из `horizon: hot` в `warm` до коммита. Полный скан дормантных кандидатов (HOT→WARM/WARM→COLD/COLD→archive) — не здесь, это уже делают Week Close §7d и Month Close §1f на своей каденции.
 
 ### 5. Автоматические шаги
 `IWE_PATHS="${IWE_PATHS_FILE:-}"; if [ -z "$IWE_PATHS" ]; then for _c in "$PWD/.iwe-paths" "${IWE_WORKSPACE:-$HOME/IWE}/.iwe-paths" "$HOME/.iwe-paths"; do [ -r "$_c" ] && { IWE_PATHS="$_c"; break; }; done; fi; [ -n "$IWE_PATHS" ] && . "$IWE_PATHS" 2>/dev/null; "$IWE_SCRIPTS/day-close.sh"` — источник переменных явный (issue #688, см. шаг 0б), Linear sync, backup (memory/ + CLAUDE.md), reindex, консолидация сессий дня. Обновление платформы (`update.sh`) сюда НЕ входит (issue #945): это сетевая операция со своим ритуалом; о доступном обновлении сообщает таблица состояния IWE при Day Open (`update.sh --check --fast`), применяется отдельно (`/iwe-update`).
@@ -162,7 +179,7 @@ Sub-agent Haiku R23 (context isolation): передать чеклист + че�
 - [ ] WP-REGISTRY.md обновлён
 - [ ] WeekPlan обновлён (grep по номерам РП — ВСЕ упоминания)
 - [ ] DayPlan обновлён (статусы ВСЕХ строк: РП + ad-hoc) — **N/A на strategy_day** (шаг 0в)
-- [ ] open-sessions.log: строки закрытых сессий удалены
+- [ ] Сессии дня сверены по open-sessions.log (журнал не правится), зависшие семафоры закрыты через session-guard
 - [ ] Captures за день применены (все Quick Close → KE пройден)
 - [ ] Утренние приоритеты (шаг 7з): `current/priorities.yaml` → `last_updated` = день после закрываемого, ИЛИ в отчёте закрытия явно записано «приоритеты не обновлены (пропущено пилотом)». Ни того ни другого → вернуться к шагу 7з и спросить пилота (issue #944)
 - [ ] **Синхронизация рабочих копий (поручение пилота 21.08):** все машины/копии установки ↔ GitHub синхронизированы, за исключением работающих сейчас сессий. Проверка: `git status -sb` в governance-репо (без ahead/behind) + статус sync-скрипта вторичных копий (если настроен, напр. `remote-git-sync.sh --status`). «Deferred из-за живого семафора» — норма для реально работающей сессии; протухший семафор при запушенном отчёте — аномалия: закрыть семафор до завершения Day Close.
@@ -170,7 +187,7 @@ Sub-agent Haiku R23 (context isolation): передать чеклист + че�
 - [ ] Repo CLAUDE.md: feat-коммиты → новые правила?
 - [ ] DayPlan сегодня → `archive/day-plans/` (старые DayPlan'ы в `current/` тоже) — **DayPlan сегодня N/A на strategy_day** (шаг 0в), старые — архивировать в любом случае
 - [ ] WP context: done → `mv inbox/ → archive/wp-contexts/`
-- [ ] Lesson Hygiene: уроки MEMORY.md ≤8
+- [ ] Lesson Hygiene: HOT-лимит памяти (`memory-bleed.sh --hot-only`) в норме
 - [ ] Draft-list: Pack обогащён → черновик предложен?
 - [ ] Видео: обработанные помечены (если video.enabled)
 - [ ] Governance: REPOSITORY-REGISTRY, navigation.md, MAP.002

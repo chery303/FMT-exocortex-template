@@ -12,6 +12,13 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/iwe-issue-536-backup.XXXXXX")"
 BACKUP_MANIFEST=".day-close-backup-manifest.json"
 BACKUP_QUARANTINE=".day-close-backup-incomplete"
 
+# Runs below swap HOME for a fake one. With PyYAML installed by
+# `pip install --user`, that hid the module and day-close took its
+# "no PyYAML" branch — two false failures on macOS (issue #1342). Pin the
+# real user site; the no-PyYAML case still wins via PYTHONPATH.
+PYTHONUSERBASE="${PYTHONUSERBASE:-$(python3 -m site --user-base 2>/dev/null)}"
+export PYTHONUSERBASE
+
 FAIL=0
 fail() { echo "  ❌ FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 pass() { echo "  ✅ PASS: $*"; }
@@ -33,9 +40,15 @@ sha256_file() {
     fi
 }
 
+# This test covers day-close's copy rules (ownership manifest, protected roots,
+# byte-preserving configs) — the same code in both modes. It runs the unfrozen
+# mode, which writes them straight into <governance>/exocortex/; under the
+# default freeze the same rules fill a snapshot that is published from an
+# isolated worktree instead (issue #1279, test_issue_1279_exo_publish.sh).
 run_backup() {
     local workspace=$1 memory=$2 output=$3
     env \
+        IWE_FROZEN_CANONICAL_PATH="" \
         HOME="$workspace/home" \
         PATH="$PATH" \
         WORKSPACE_DIR="$workspace" \
@@ -1022,11 +1035,11 @@ if command -v jq >/dev/null 2>&1; then
     printf '%s\n' \
         "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$HOOK_MEMORY/day-rhythm-config.yaml\"}}" | \
         env HOME="$HOOK_WS/home" WORKSPACE_DIR="$HOOK_WS" GOVERNANCE_REPO=governance \
-            IWE_MEMORY_SRC="$HOOK_MEMORY" bash "$MEMORY_HOOK"
+            IWE_MEMORY_SRC="$HOOK_MEMORY" IWE_FROZEN_CANONICAL_PATH="" bash "$MEMORY_HOOK"
     printf '%s\n' \
         "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$HOOK_MEMORY/direct.md\"}}" | \
         env HOME="$HOOK_WS/home" WORKSPACE_DIR="$HOOK_WS" GOVERNANCE_REPO=governance \
-            IWE_MEMORY_SRC="$HOOK_MEMORY" bash "$MEMORY_HOOK"
+            IWE_MEMORY_SRC="$HOOK_MEMORY" IWE_FROZEN_CANONICAL_PATH="" bash "$MEMORY_HOOK"
     if cmp -s "$HOOK_CASE/expected-rhythm.yaml" "$HOOK_EXO/day-rhythm-config.yaml" && \
        [ "$(cat "$HOOK_EXO/direct.md" 2>/dev/null || true)" = "ordinary direct" ]; then
         pass "direct hook skips day-rhythm but still mirrors ordinary memory"
@@ -1038,7 +1051,7 @@ if command -v jq >/dev/null 2>&1; then
     printf 'day_open:\n  calendar_ids: [new-source]\n' > "$HOOK_MEMORY/day-rhythm-config.yaml"
     printf '%s\n' '{"tool_name":"Bash","tool_input":{}}' | \
         env HOME="$HOOK_WS/home" WORKSPACE_DIR="$HOOK_WS" GOVERNANCE_REPO=governance \
-            IWE_MEMORY_SRC="$HOOK_MEMORY" bash "$MEMORY_HOOK"
+            IWE_MEMORY_SRC="$HOOK_MEMORY" IWE_FROZEN_CANONICAL_PATH="" bash "$MEMORY_HOOK"
     if cmp -s "$HOOK_CASE/expected-rhythm.yaml" "$HOOK_EXO/day-rhythm-config.yaml" && \
        [ "$(cat "$HOOK_EXO/bash.md" 2>/dev/null || true)" = "ordinary Bash reconcile" ]; then
         pass "Bash hook reconcile skips day-rhythm but mirrors ordinary memory"

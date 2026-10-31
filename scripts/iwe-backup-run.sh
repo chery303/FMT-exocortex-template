@@ -12,7 +12,10 @@
 # (согласована пир-сессией: 7 дневных / 4 недельных / 6 месячных для тега
 # `scheduled`; тег `protect` не трогается этим скриптом вовсе).
 #
-# Расписание — вне этого скрипта (launchd plist, см. templates/iwe-backup-run.plist).
+# Расписание — вне этого скрипта: ежедневный запуск делает планировщик роли
+# Synchronizer (roles/synchronizer/scripts/scheduler.sh) через scripts/iwe-backup.sh,
+# отдельного файла расписания у restic нет. Без установленной роли — только вручную.
+# Выбор движка (tar/restic) и договор бэкапа — в scripts/iwe-backup.sh.
 #
 # USAGE:
 #   iwe-backup-run.sh [--with-optional]
@@ -59,11 +62,12 @@ fi
 
 # Тот же разбор, что в iwe-backup-check.sh (раздел 4) — печатает только
 # существующие пути, т.к. restic backup отказывает на несуществующем пути.
-PATHS_TSV=$(HOME="$HOME" SOURCES_FILE="$SOURCES_FILE" SOURCES_OVERRIDE="$SOURCES_OVERRIDE" WITH_OPTIONAL="$WITH_OPTIONAL" python3 <<'PYEOF'
+PATHS_TSV=$(HOME="$HOME" WORKSPACE_ROOT="$IWE_ROOT" SOURCES_FILE="$SOURCES_FILE" SOURCES_OVERRIDE="$SOURCES_OVERRIDE" WITH_OPTIONAL="$WITH_OPTIONAL" python3 <<'PYEOF'
 import os
 import yaml
 
 home = os.environ["HOME"]
+workspace = os.environ["WORKSPACE_ROOT"]
 with_optional = os.environ["WITH_OPTIONAL"] == "1"
 
 
@@ -86,12 +90,20 @@ tiers = ["tier0_unique", "tier1_scheduled"]
 if with_optional:
     tiers.append("tier2_optional")
 
-for tier in tiers:
-    entries = list(defaults.get(tier, [])) + list(override.get(tier, []))
-    for entry in entries:
-        path = entry.get("path", "").replace("${HOME}", home)
-        if os.path.exists(path):
-            print(path)
+# Same merge as iwe-backup-check.sh: an override entry with the same path
+# replaces the default one; `tierX:` with an empty value is an empty list.
+sources = {}
+for layer in (defaults, override):
+    for tier in tiers:
+        for entry in layer.get(tier) or []:
+            raw_path = entry.get("path") or ""
+            if not raw_path:
+                continue
+            path = raw_path.replace("${HOME}", home).replace("${WORKSPACE_DIR}", workspace)
+            sources[os.path.realpath(path)] = path
+for path in sources.values():
+    if os.path.exists(path):
+        print(path)
 PYEOF
 ) || PATHS_TSV=""
 
@@ -100,7 +112,13 @@ if [ -z "$PATHS_TSV" ]; then
     exit 1
 fi
 
-mapfile -t PATHS <<< "$PATHS_TSV"
+# bash 3.2 (macOS /bin/bash) has no mapfile
+PATHS=()
+while IFS= read -r source_path; do
+    if [ -n "$source_path" ]; then
+        PATHS+=("$source_path")
+    fi
+done <<< "$PATHS_TSV"
 
 PROTECT_DIR="$HOME/.iwe-backup"
 REPO_DIR="$PROTECT_DIR/protect-repo"
@@ -115,6 +133,37 @@ if [ ! -s "$KEY_FILE" ]; then
     mv "$KEY_TMP" "$KEY_FILE"
     echo "ℹ️  [backup-run] создан новый ключ шифрования защитного хранилища: $KEY_FILE" >&2
     echo "    Сохраните резервную копию этого файла отдельно — его потеря делает все будущие снимки нечитаемыми." >&2
+fi
+
+# A key readable by other users, owned by someone else or replaced by a symlink makes
+# the encrypted store only as safe as that file. Stop BEFORE restic touches it; the
+# content of the key is never printed.
+key_file_unsafe() {  # prints the reason and returns 0 when the key file must not be used
+    local f="$1" mode owner
+    if [ -L "$f" ]; then
+        echo "файл ключа - символьная ссылка"
+        return 0
+    fi
+    if [ "$(uname -s)" = Darwin ]; then
+        read -r mode owner < <(stat -f '%Lp %u' "$f")
+    else
+        read -r mode owner < <(stat -c '%a %u' "$f")
+    fi
+    if [ "$owner" != "$(id -u)" ]; then
+        echo "владелец файла ключа - другой пользователь"
+        return 0
+    fi
+    if [ "${mode: -2}" != "00" ]; then
+        echo "файл ключа доступен другим пользователям (права $mode)"
+        return 0
+    fi
+    return 1
+}
+
+if KEY_PROBLEM="$(key_file_unsafe "$KEY_FILE")"; then
+    echo "❌ [backup-run] небезопасный файл ключа: $KEY_PROBLEM — снимок не снят." >&2
+    echo "    Исправить: chmod 600 \"$KEY_FILE\" (владелец - вы, не ссылка). Содержимое ключа не показывается." >&2
+    exit 1
 fi
 
 export RESTIC_REPOSITORY="$REPO_DIR"

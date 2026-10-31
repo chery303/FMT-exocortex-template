@@ -968,6 +968,36 @@ sys.stdout.write(yaml.safe_dump({"task": value}, allow_unicode=True, default_flo
 #   4. Default path doesn't exist at all -- genuinely unmigrated. Legacy
 #      fallback to "$GOV_REPO/sessions" with a visible WARN, same
 #      behaviour as before this function existed.
+# governance_checkout_for_cwd -- the governance checkout this session works in.
+# Without --isolate the semaphore always recorded the canonical path, even
+# when open ran from a manual `git worktree add` of the governance repo, so
+# close never looked at that worktree's unpushed commits (issue #823). A
+# linked worktree is recognised by sharing the canonical repo's git common
+# dir; anything else keeps the canonical path.
+# git_common_dir DIR -- physical path of DIR's shared git dir (same for the
+# main checkout and every linked worktree of one repository).
+git_common_dir() {
+  (cd "$1" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P) || true
+}
+# same_git_repo A B -- A and B are checkouts (main or linked) of one repository.
+same_git_repo() {
+  local a b
+  a=$(git_common_dir "$1"); b=$(git_common_dir "$2")
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+governance_checkout_for_cwd() {
+  local canon="$IWE_ROOT/$GOV_REPO" top
+  top=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$top" ] && [ "$(realpath "$top" 2>/dev/null)" != "$(realpath "$canon" 2>/dev/null)" ] \
+     && same_git_repo "$top" "$canon"; then
+    realpath "$top"
+    return 0
+  fi
+  echo "$canon"
+}
+
+# --no-create: report the legacy path without creating it (open under
+# --isolate decides where the scaffold goes only after the worktree exists).
 resolve_orz_sessions_dir() {
   if [ -n "${IWE_SESSIONS_ROOT:-}" ]; then
     if [ -d "$IWE_SESSIONS_ROOT" ] && git -C "$IWE_SESSIONS_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
@@ -988,7 +1018,7 @@ resolve_orz_sessions_dir() {
 
   echo "WARN: MC-sessions не найден ($default_mc) -- использую legacy-путь \$GOV_REPO/sessions (обычное поведение немигрированной установки шаблона)" >&2
   local legacy="$IWE_ROOT/$GOV_REPO/sessions"
-  mkdir -p "$legacy"
+  [ "${1:-}" = "--no-create" ] || mkdir -p "$legacy"
   echo "$legacy"
 }
 # Passive default here (no resolver call, no side effect) -- this line runs
@@ -1029,7 +1059,13 @@ semaphore_epoch() {
 #      (sweep_orphaned_semaphores выше читает `head -1`);
 #   3. имя файла аренды производно от имени семафора — привязка к конкретной
 #      сессии структурная, продлить чужую аренду «заодно» нельзя.
-LEASE_SEC="${IWE_SESSION_LEASE_SEC:-14400}"  # 4h; продление — `renew`
+# Default 24h, not the author's 4h: WP-484 Ф49 protected against an orphaned
+# semaphore handing commit rights to a DIFFERENT concurrent agent on the same
+# checkout (author runs Kimi+Codex+Claude in parallel). A solo install has no
+# second agent to race against, so the original 4h just blocked a normal
+# single-session workday without protecting anything — set IWE_SESSION_LEASE_SEC
+# explicitly if you do run concurrent agents against one checkout.
+LEASE_SEC="${IWE_SESSION_LEASE_SEC:-86400}"  # 24h; продление — `renew`
 
 lease_deadline_epoch() {
   local semaphore="$1" base_epoch renewed_at renewed_epoch=""
@@ -1385,6 +1421,13 @@ if [ "$CMD" = "open" ]; then
       echo "slug: $HOUSEKEEPING"
       echo "session_id: $HK_SESSION_ID"
       echo "created_at: $(now_iso)"
+      # WP-561, cold-review (peer-session 2026-10-22-17): session-open-gate.sh
+      # only ever selects semaphores carrying a literal `harness_session_id:
+      # $SESSION_ID` line -- without it ALL housekeeping reasons (day-open,
+      # day-close, week-close, month-close, update-delivery) are invisible to
+      # that gate's whitelist check, same gap as the plain open path already
+      # closes below (this fix mirrors that, scoped to housekeeping).
+      [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && echo "harness_session_id: $CLAUDE_CODE_SESSION_ID"
       # $$ here is session-guard.sh's own transient process — already dead by
       # the time anyone checks it (verified live 08.08: recorded pid was dead
       # within the same second). $CLAUDE_PID is the actual long-lived Claude
@@ -1529,9 +1572,8 @@ if [ "$CMD" = "open" ]; then
   # WP-526 Ф2 (29.08): `open` is the only writer, so it's the only place that
   # needs the strict (fail-closed-if-broken) resolution -- overrides the
   # passive default set at the top of the script for read-only commands.
-  ORZ_DIR="$(resolve_orz_sessions_dir)"
+  ORZ_DIR="$(resolve_orz_sessions_dir --no-create)"
   ORZ_FILE="$ORZ_DIR/$ORZ_BASENAME"
-  mkdir -p "$(dirname "$ORZ_FILE")"
   # --- WP-485 Ф14: logical freeze on open (carve-outs: --isolate, --canonical-owner, exact-slug re-entry) ---
   if [ "${#FROZEN_CANONICAL_PATHS[@]}" -gt 0 ] && [ -z "${CANONICAL_OWNER:-}" ] && [ "${ISOLATE_FLAG:-0}" != "1" ]; then
     ACTUAL_CWD_TOPLEVEL=$(frozen_checkout_match)
@@ -1689,6 +1731,29 @@ if [ "$CMD" = "open" ]; then
       || fail "--isolate: не удалось канонизировать путь worktree" 1
   fi
 
+  # issue #1279: OPEN_LOG defaulted to the canonical governance repo
+  # ($IWE_ROOT/$GOV_REPO) at module scope, before --isolate was even parsed,
+  # so `open` under isolate still appended to the frozen canonical checkout —
+  # the same drift resolve_orz_sessions_dir() already avoids for the ORZ
+  # scaffold. Redirect it into the isolated worktree so the allowlist
+  # registration below (which keys off this same variable) and the actual
+  # append target agree.
+  if [ "${ISOLATE_FLAG:-0}" = "1" ] && [ -n "${ISOLATED_WORKTREE_PATH:-}" ]; then
+    OPEN_LOG="$ISOLATED_WORKTREE_PATH/inbox/open-sessions.log"
+    mkdir -p "$(dirname "$OPEN_LOG")"
+  fi
+  # issue #1279: without MC-sessions the ORZ scaffold falls back to
+  # $GOV_REPO/sessions -- inside the frozen canon. When the isolated worktree
+  # is the governance repo itself, put the scaffold there; the semaphore's
+  # orz_sessions_dir tells close where to find it.
+  if [ "${ISOLATE_FLAG:-0}" = "1" ] && [ -n "${ISOLATED_WORKTREE_PATH:-}" ] \
+     && [ "$ORZ_DIR" = "$IWE_ROOT/$GOV_REPO/sessions" ] \
+     && same_git_repo "$ISOLATE_BASE_DIR" "$IWE_ROOT/$GOV_REPO"; then
+    ORZ_DIR="$ISOLATED_WORKTREE_PATH/sessions"
+    ORZ_FILE="$ORZ_DIR/$ORZ_BASENAME"
+  fi
+  mkdir -p "$(dirname "$ORZ_FILE")"
+
   if [ "${ISOLATE_FLAG:-0}" = "1" ] && [ -f "$SEM_FILE" ]; then
     echo "Session OPEN (re-entry): $SEM_FILE (WP: $WP, agent: $AGENT, slug: ${SLUG:-$WP})"
     printf '{"worktree_path": "%s", "branch": "%s", "session_id": "%s"}\n' \
@@ -1719,7 +1784,7 @@ if [ "$CMD" = "open" ]; then
       echo "isolated_worktree: $ISOLATED_WORKTREE_PATH"
       echo "isolated_branch: $ISOLATED_WORKTREE_BRANCH"
     else
-      echo "governance_worktree: $IWE_ROOT/$GOV_REPO"
+      echo "governance_worktree: $(governance_checkout_for_cwd)"
     fi
     echo "orz_sessions_dir: $ORZ_DIR"
     echo "orz_file: $ORZ_BASENAME"
@@ -2111,11 +2176,16 @@ if [ "$CMD" = "close" ]; then
   # WP-526 Ф2 (29.08): must resolve the same way `open` did, or `close` looks
   # for the ORZ file at the passive legacy default while `open` actually
   # wrote it under MC-sessions -- validate_orz below would then fail on an
-  # existing, correctly-written file. This semaphore has no orz_sessions_dir
-  # field (root's more evolved variant does) to read the resolved dir back
-  # from, but the resolver is a pure function of current filesystem state,
-  # so recomputing it here agrees with what `open` computed moments earlier.
-  ORZ_DIR="$(resolve_orz_sessions_dir)"
+  # existing, correctly-written file. The semaphore records the directory
+  # open actually used (orz_sessions_dir); under --isolate on an install
+  # without MC-sessions that is the isolated worktree, which the resolver
+  # cannot recompute (issue #1279). Older semaphores fall back to it.
+  ORZ_DIR=$(grep "^orz_sessions_dir: " "$SEM_FILE" | cut -d' ' -f2- || true)
+  if [ -z "$ORZ_DIR" ] || [ ! -d "$ORZ_DIR" ]; then
+    # --no-create: close only reads; recreating $GOV_REPO/sessions here would
+    # write into a frozen canon just before validation fails.
+    ORZ_DIR="$(resolve_orz_sessions_dir --no-create)"
+  fi
   ORZ_FILE="$ORZ_DIR/$ORZ_BASENAME"
 
   echo "Session CLOSE: проверяю ORZ $ORZ_FILE ..."
@@ -2275,7 +2345,19 @@ print(json.dumps({"wp": sys.argv[1], "slug": sys.argv[2], "agent": sys.argv[3], 
   _warn_unpushed "$ORZ_DIR"
   # Also check repos inferred from file: entries in the semaphore
   # Семафор к этому моменту уже опубликован как durable .closed receipt.
-  _seen_repos="$ORZ_DIR"
+  # Dedupe by repository root, not by path: ORZ_DIR is a sessions/ subdirectory
+  # of its repo, so a path comparison never matched and warned twice.
+  _seen_repos=$(git -C "$ORZ_DIR" rev-parse --show-toplevel 2>/dev/null || echo "$ORZ_DIR")
+  # issue #823: the governance checkout open actually ran in (a manual linked
+  # worktree is recorded there, see governance_checkout_for_cwd).
+  _gov_wt=$(grep "^governance_worktree: " "$_sem_read" 2>/dev/null | head -1 | cut -d' ' -f2- || true)
+  _gov_top=""
+  [ -n "$_gov_wt" ] && [ -d "$_gov_wt" ] && _gov_top=$(git -C "$_gov_wt" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$_gov_top" ] && ! printf '%s\n' "$_seen_repos" | grep -qxF "$_gov_top"; then
+    _seen_repos="$_seen_repos
+$_gov_top"
+    _warn_unpushed "$_gov_top"
+  fi
   while IFS= read -r _line; do
     [[ "$_line" =~ ^file:\ (.*) ]] || continue
     _repo=$(git -C "$IWE_ROOT/$(dirname "${BASH_REMATCH[1]}")" rev-parse --show-toplevel 2>/dev/null || true)

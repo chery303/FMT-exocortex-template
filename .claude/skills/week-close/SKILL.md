@@ -40,6 +40,23 @@ Week Close = протокол. Блокирующее требование — �
 ### 0. Extensions (before)
 Загрузить: `bash .claude/scripts/load-extensions.sh week-close before`. Exit 0 → `Read` каждый файл из вывода (alphabetic) → выполнить как первые шаги. Exit 1 → пропустить. Поддерживает `extensions/week-close.before.md` И `extensions/week-close.before.<suffix>.md`.
 
+### 0а. Session-guard: привязка к РП-1 (S-68 — каждый коммит обязан нести реальный РП)
+Week Close сам по себе не рабочий продукт (см. `gates_rationale` выше — исключение из WP Gate уже заявлено для этого скилла), но `session-open-gate.sh` (отдельный, более узкий гейт именно на `git commit`/`push`, S-68) исключения не делает — финальный коммит протокола без привязки к `--wp` будет отклонён. Если сессия уже привязана к другому РП, вторая привязка не нужна:
+```bash
+HARNESS_ID="${CLAUDE_CODE_SESSION_ID:-}"
+SESSION_DIR="${IWE_ROOT:-$HOME/IWE}/.iwe-runtime/sessions"
+AGENT="${IWE_AGENT:-claude-code}"
+ALREADY_BOUND=0
+if [ -n "$HARNESS_ID" ]; then
+  while IFS= read -r sem; do
+    [ -z "$sem" ] && continue
+    grep -qE '^wp: .+' "$sem" 2>/dev/null && { ALREADY_BOUND=1; break; }
+  done < <(grep -lxF "harness_session_id: $HARNESS_ID" "$SESSION_DIR/${AGENT}"-*.open 2>/dev/null)
+fi
+[ "$ALREADY_BOUND" = 1 ] || bash "${IWE_SCRIPTS:-$HOME/IWE/scripts}/session-guard.sh" open --housekeeping week-close --agent "$AGENT" 2>&1 || true
+```
+`session-open-gate.sh` принимает `housekeeping: week-close` как легитимную привязку — это закрытый список из 4 операционных протоколов, не произвольная причина (S-68 запрещает именно произвольные `--housekeeping`-обходы, не эти четыре). Отказ открытия (коллизия с параллельной сессией) не блокирует протокол.
+
 ### 1. Сбор данных за 7 дней
 
 **Коммиты:**
@@ -107,7 +124,7 @@ WP-NNN: pending-фазы (M):
 ### 6. Captures и уроки
 
 - Просмотреть `inbox/fleeting-notes.md` за неделю → маршрутизировать невыключенные.
-- Уроки сессий → MEMORY.md + thematic `lessons_*.md` (если есть).
+- Уроки сессий памяти — см. §7d ниже (`memory-bleed.sh`, issue #1314: прежняя формулировка здесь ссылалась на несуществующую секцию «Уроки» в MEMORY.md и дублировала §7d).
 - Drift-scan недели: что в MEMORY.md устарело за 7 дней.
 - **Проверка полноты переноса перед архивацией (WP-5, 2026-07-10):** `bash {{IWE_SCRIPTS}}/check-wp-transfer-completeness.sh --all "${IWE_ROOT:-$HOME/IWE}"` по `inbox/WP-N/` — выводит `results_not_captured`-флаги (проставленные при закрытии без заполненного `results_in`) и файлы в подпапках без учёта в основном контекст-файле. Для каждого warning — пилот решает: (a) действительно нужен перенос знания, найти куда; (b) файл технический/устарел, можно оставить; (c) `results_in` заполнить постфактум. Не блокирует Close.
 
@@ -152,19 +169,19 @@ grep -qE '^backup_enabled:[[:space:]]*false([[:space:]]*(#.*)?)?$' "${WORKSPACE_
 bash ${IWE_SCRIPTS}/iwe-backup-check.sh
 ```
 
-Если вернул ❌ (exit 2) — устранить критичные gaps ДО бэкапа (устаревший бэкап >14 дней, нет директории бэкапа — по умолчанию iCloud, либо `backup_dir` из `params.yaml`, если задан).  
-Если вернул ⚠️ (exit 1) — зафиксировать warnings в WeekReport, продолжить.  
+Если вернул ❌ (exit 2) — устранить критичные gaps ДО бэкапа (устаревший бэкап >14 дней, недоступная цель бэкапа — iCloud Drive по умолчанию либо `backup_dir` из `params.yaml`, если задан: не включён iCloud Drive, том не подключён или папка только для чтения).  
+Если вернул ⚠️ (exit 1) — зафиксировать warnings в WeekReport, продолжить. Предупреждение «архивов пока нет» (первая неделя на новой установке или новый `backup_dir`) — не повод пропускать 7b: именно 7b создаёт первый архив.  
 Если ✅ (exit 0) — бэкап в норме.
 
-#### 7b. Бэкап IWE в iCloud
+#### 7b. Бэкап IWE в архив
 
-> Условный шаг: только macOS с iCloud Drive, и только если `BACKUP_DISABLED=0` (см. 7a). Запускать ТОЛЬКО если 7a не вернул ❌.
+> Условный шаг: только если цель бэкапа задана — iCloud Drive на macOS по умолчанию или `backup_dir` из `params.yaml` на любой ОС (issue #1349), и только если `BACKUP_DISABLED=0` (см. 7a). Запускать ТОЛЬКО если 7a не вернул ❌; при предупреждении «архивов пока нет» — выполнять, это и создаёт первый архив. Цели нет (не macOS и `backup_dir` пуст; 7a пишет N/A) — шаг пропустить.
 
 ```bash
 ${IWE_SCRIPTS}/backup-icloud.sh
 ```
 
-Архив всех файлов IWE (без `.git`, `node_modules`, `.venv`) → iCloud Drive. Хранит 4 последних архива.
+Архив всех файлов IWE (без `.git`, `node_modules`, `.venv`) → цель бэкапа (`backup_dir` или iCloud Drive). Хранит 4 последних архива.
 
 #### 7c. Скан незакоммиченных файлов
 
@@ -294,7 +311,7 @@ git push
 - [ ] Captures маршрутизированы, уроки записаны
 - [ ] Drift-scan недели: устаревшие факты обновлены
 - [ ] Проверка бэкапов (iwe-backup-check.sh) выполнена
-- [ ] iCloud backup выполнен (если macOS)
+- [ ] Бэкап в архив выполнен (если задана цель: iCloud Drive на macOS или `backup_dir`)
 - [ ] Dirty repos: 0 (или явно проигнорированы)
 - [ ] ТО памяти: distinctions.md/MEMORY.md/memory/*.md проверены, флаги зафиксированы (или «норма»)
 - [ ] Итоги W{N} записаны в WeekPlan
